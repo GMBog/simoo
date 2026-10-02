@@ -1,0 +1,12 @@
+name: GenApp
+title: GenApp
+username: gmbog
+account: gmbog
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 18078039
+bundleId: 12640311
+url: https://gmbog.shinyapps.io/GenApp/
+version: 1
+asMultiple: FALSE
+asStatic: FALSE
