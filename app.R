@@ -84,26 +84,32 @@ LETHAL_FREQ   <- 0.02
 # heritability and data availability when comparing trait reliabilities.
 METH_REC_FRAC <- 0.15
 MAX_COW_AGE   <- 8
-N_AI_BULLS    <- 10
+N_AI_BULLS      <- 15   # max AI bulls in catalogue at any time
+N_AI_BULLS_NEW  <- 7    # new bulls added per generation (5-10)
+N_AI_BULLS_MIN  <- 10   # minimum total in catalogue
+# ── Herd size limits ─────────────────────────────────────────────────────────
+# Students cannot grow or shrink herd by more than 25% from the target size.
+HERD_SIZE_FLEX  <- 0.25  # ±25% of n_cows_target
 # ── Annual AI semen budget ────────────────────────────────────────────────────
 # Each year the student receives BUDGET_PER_COW × herd_size dollars to spend
 # on AI semen.  Three simple tiers reflect real-world market logic:
 #
-#   ≥150 daughters (PROVEN / high rel)    → $25 / dose
-#   40–149 daughters (SAMPLED / mod rel)  → $15 / dose
-#   <40  daughters (YOUNG / low rel)      → $ 8 / dose
-#   Home-raised bulls                     → $ 2 / dose  (handling only)
+#   ≥150 daughters (PROVEN / high rel >80%)    → $25 / dose
+#   40–149 daughters (SAMPLED / mid rel ~55%)  → $15 / dose
+#   <40  daughters (YOUNG genomic / ~30% rel)  → $ 8 / dose
+#   Home-raised bulls                          → $ 2 / dose  (handling only)
 #
-# Pedagogical tension: with $20/cow budget and 100 cows = $2,000/yr
-#   All proven  ($25): $2,500 → 25% over budget (must mix or cut bulls)
-#   Mix proven + sampled → ~$20 avg → right on budget
-#   All young   ($ 8): $800  → lots of room, but low reliability
-BUDGET_PER_COW <- 20   # $ per cow per year
+# Pedagogical tension: with $15/cow budget and 30 cows = $450/yr
+#   All proven  ($25): need 18 matings → $450 exactly fits
+#   Mix proven + young → cheaper but lower accuracy
+BUDGET_PER_COW <- 15   # $ per cow per year
 
 compute_dose_price <- function(n_dau, source = "AI") {
-  # Compute tier price from daughters first (preserves vector length of n_dau)
-  price <- ifelse(n_dau >= 150, 25, ifelse(n_dau >= 40, 15, 8))
-  # Then override home-raised bulls with $2 (source may be scalar or vector)
+  # Price tiers based on daughter count (reflects real-world market):
+  #   Proven sires of sires (≥500 dau, >85% rel) → $25
+  #   Young proven          (100-499 dau, ~65-85%) → $15
+  #   Genomic / no daughters (<100 dau, ~28-65%)  → $8
+  price <- ifelse(n_dau >= 500, 25, ifelse(n_dau >= 100, 15, 8))
   ifelse(source == "Herd", 2, price)
 }
 
@@ -215,6 +221,40 @@ estimate_pta <- function(rec_mean, n_recs, true_bv, pa_rel=NULL) {
   list(pta=r2*true_pta+noise, reliability=r2)
 }
 
+# ── Bull-specific PTA estimation ──────────────────────────────────────────────
+# Bulls get reliability from TWO sources:
+#   1. Genomic markers (base ~28% for all bulls, even with 0 daughters)
+#   2. Daughter records — each daughter contributes h²/4 of information
+#      (half-sib relationship), NOT a full record.
+# This gives realistic reliability scaling:
+#   0  daughters  → ~28%  (genomic only)
+#   50 daughters  → ~50%
+#   200 daughters → ~74%
+#   500 daughters → ~85%
+#   1000+ dau.    → ~90%+ (elite sire of sires)
+GENOMIC_BASE_REL <- 0.28   # reliability from genomic markers alone
+
+estimate_bull_pta <- function(n_daughters, true_bv) {
+  # Convert genomic base to equivalent own records, then add daughter info.
+  # h2/4 per daughter = half-sib contribution (Falconer & Mackay)
+  base_r2   <- GENOMIC_BASE_REL
+  base_r2   <- pmin(base_r2, 0.9999)
+  # Per-trait: daughters contribute h2[trait]/4 equivalent records each
+  dau_equiv <- n_daughters * h2 / 4
+  names(dau_equiv) <- TRAIT_NAMES
+  # Genomic base as equivalent records
+  gen_equiv <- base_r2 * (1 - h2) / (h2 * (1 - base_r2))
+  eff_n     <- gen_equiv + dau_equiv
+  # Methane: fewer daughters have methane records
+  eff_n["methane"] <- eff_n["methane"] * METH_REC_FRAC
+  r2        <- (eff_n * h2) / (eff_n * h2 + (1 - h2))
+  true_pta  <- true_bv / 2
+  noise     <- sapply(seq_along(TRAIT_NAMES), function(i)
+    rnorm(1, 0, sqrt(1 - r2[i]) * sqrt(Vg[i]) / 2))
+  names(noise) <- TRAIT_NAMES
+  list(pta = r2 * true_pta + noise, reliability = r2)
+}
+
 compute_merit <- function(pta_vec) sum((pta_vec/pheno_sd*100)*MERIT_WEIGHTS)
 
 fmt0 <- function(x) formatC(round(x,0), format="f", digits=0)
@@ -286,20 +326,21 @@ initialize_sim <- function(seed=42, start_year=1, n_cows_target=100, n_years=5) 
     cow_pta[i,] <- res$pta; cow_rel[i,] <- res$reliability
   }
 
-  # ── Reliability tiers for the 20 AI founders ─────────────────────────────────
-  # High (proven, many daughters): ~7 bulls  → 150-300 daughters
-  # Moderate (young sires):        ~7 bulls  → 40-80  daughters
-  # Low (genomic / PA only):       ~6 bulls  → 5-30   daughters
-  n_high_f <- 4L; n_mod_f <- 3L; n_low_f <- 3L   # sums to N_AI_BULLS = 10
-  founder_ndau <- c(sample(150:300, n_high_f, replace=TRUE),
-                    sample(40:80,   n_mod_f,  replace=TRUE),
-                    sample(5:30,    n_low_f,  replace=TRUE))
-  founder_ndau <- founder_ndau[sample(N_AI_BULLS)]   # shuffle tier order
+  # ── Reliability tiers for founder AI bulls ────────────────────────────────
+  # Realistic daughter counts → reliability via estimate_bull_pta:
+  #   Proven sires of sires (500-2000 dau) → ~85-90% rel  → $25/dose
+  #   Young proven          (100-500 dau)  → ~65-85% rel  → $15/dose
+  #   Genomic               (0 dau)        → ~28% rel      → $8/dose
+  n_proven_f  <- 4L; n_sampled_f <- 4L; n_genomic_f <- 7L  # sums to 15
+  founder_ndau <- c(sample(500:2000, n_proven_f,  replace=TRUE),
+                    sample(100:499,  n_sampled_f, replace=TRUE),
+                    rep(0L,          n_genomic_f))
+  founder_ndau <- founder_ndau[sample(length(founder_ndau))]   # shuffle
 
   bull_pta <- bull_rel <- matrix(NA, ai_bulls@nInd, N_TRAITS,
                                   dimnames=list(NULL,TRAIT_NAMES))
   for (j in seq_len(ai_bulls@nInd)) {
-    res <- estimate_pta(rep(0,N_TRAITS), founder_ndau[j], bull_bv[j,])
+    res <- estimate_bull_pta(founder_ndau[j], bull_bv[j,])
     bull_pta[j,] <- res$pta; bull_rel[j,] <- res$reliability
   }
 
@@ -457,21 +498,37 @@ phase1_breed <- function(state, cull_ids, use_bull_ids,
   if (nrow(sel_bulls) == 0) stop("No valid bulls selected.")
 
   # ── Budget enforcement: limit how many cows can be bred ─────────────────────
-  # Cost per mating = average dose price across selected bulls.
-  # If total cost > budget, only the top-merit cows get a mating slot.
   if (!"dose_price" %in% names(sel_bulls))
     sel_bulls$dose_price <- compute_dose_price(sel_bulls$n_daughters,
                               if ("source" %in% names(sel_bulls)) sel_bulls$source else "AI")
   avg_dose_price <- mean(sel_bulls$dose_price, na.rm=TRUE)
   n_total        <- nrow(herd_df)
-  n_can_breed    <- if (is.finite(budget) && avg_dose_price > 0)
-                      min(n_total, floor(budget / avg_dose_price))
-                    else n_total
 
-  # Sort herd by merit descending; top n_can_breed cows get bred, rest open
-  merit_order     <- order(herd_df$merit, decreasing=TRUE)
-  breed_rows      <- merit_order[seq_len(n_can_breed)]
-  open_rows       <- if (n_can_breed < n_total) merit_order[(n_can_breed+1):n_total] else integer(0)
+  if (is.finite(budget) && avg_dose_price > 0) {
+    # Compute actual per-cow cost using the mating plan when available
+    merit_order <- order(herd_df$merit, decreasing=TRUE)
+    if (!is.null(mating_plan) && length(mating_plan) > 0) {
+      # Cost per cow = assigned bull price, or avg for unassigned
+      per_cow_cost <- vapply(herd_df$id, function(cid) {
+        bid <- mating_plan[[cid]]
+        if (!is.null(bid) && bid %in% sel_bulls$id)
+          sel_bulls$dose_price[sel_bulls$id == bid]
+        else avg_dose_price
+      }, numeric(1))
+      # Greedily include cows best→worst until budget exhausted
+      cumcost    <- cumsum(per_cow_cost[merit_order])
+      n_can_breed <- sum(cumcost <= budget)
+    } else {
+      n_can_breed <- min(n_total, floor(budget / avg_dose_price))
+    }
+    n_can_breed <- max(0L, n_can_breed)
+  } else {
+    merit_order <- order(herd_df$merit, decreasing=TRUE)
+    n_can_breed <- n_total
+  }
+
+  breed_rows <- merit_order[seq_len(n_can_breed)]
+  open_rows  <- if (n_can_breed < n_total) merit_order[(n_can_breed+1):n_total] else integer(0)
 
   herd_breed      <- herd_df[breed_rows, , drop=FALSE]
   cow_rec_breed   <- cow_records[breed_rows]
@@ -480,10 +537,16 @@ phase1_breed <- function(state, cull_ids, use_bull_ids,
   # ── Build bull assignment per bred cow ───────────────────────────────────────
   # specific mode: use mating_plan lookup; fallback to round-robin for unassigned
   if (!is.null(mating_plan) && length(mating_plan) > 0) {
+    rr_idx <- 0L
     bull_assign <- vapply(herd_breed$id, function(cid) {
       bid <- mating_plan[[cid]]
-      if (!is.null(bid) && bid %in% sel_bulls$id) bid
-      else sel_bulls$id[1]   # fallback: best bull
+      if (!is.null(bid) && bid %in% sel_bulls$id) {
+        bid
+      } else {
+        # Round-robin across selected bulls for unassigned cows
+        rr_idx <<- rr_idx + 1L
+        sel_bulls$id[((rr_idx - 1L) %% nrow(sel_bulls)) + 1L]
+      }
     }, character(1))
   } else {
     bull_assign <- rep(sel_bulls$id, length.out=nrow(herd_breed))
@@ -801,10 +864,13 @@ phase2_finalize <- function(state, interim, admit_heifer_ids,
   # ── 2) DEQUEUE: admit pool heifers whose entry_year has arrived ──────────────
   if (nrow(heifer_pool$df) > 0) {
     ready_idx <- which(heifer_pool$df$entry_year == new_yr)
-    # Filter to student-selected heifers; if NULL admit all ready ones
-    enter_idx <- if (!is.null(select_heifer_ids) && length(select_heifer_ids) > 0)
+    # NULL  → no UI selection was made → admit all ready (backward-compat / auto)
+    # character(0) → student explicitly selected none → none enter
+    # c("H001",...) → only those IDs enter
+    enter_idx <- if (is.null(select_heifer_ids))
+                   ready_idx
+                 else
                    ready_idx[heifer_pool$df$id[ready_idx] %in% select_heifer_ids]
-                 else ready_idx
     # Remove the ready-but-not-selected heifers from pool (they age out)
     drop_idx  <- setdiff(ready_idx, enter_idx)
     if (length(drop_idx) > 0) {
@@ -823,6 +889,15 @@ phase2_finalize <- function(state, interim, admit_heifer_ids,
       enter_idx <- which(heifer_pool$df$entry_year == new_yr)
     }
     if (length(enter_idx) > 0) {
+      # Hard cap: never exceed ±25% of target herd size
+      n_target   <- state$n_cows_target
+      max_herd   <- ceiling(n_target * (1 + HERD_SIZE_FLEX))
+      slots_left <- max(0L, max_herd - nrow(herd_df))
+      if (length(enter_idx) > slots_left) {
+        # Drop lowest-merit heifers to stay within cap
+        merit_order <- order(heifer_pool$df$merit[enter_idx], decreasing=TRUE)
+        enter_idx   <- enter_idx[merit_order[seq_len(slots_left)]]
+      }
       enter_df  <- heifer_pool$df[enter_idx, ]
       enter_bvs <- heifer_pool$bvs[enter_idx,,drop=FALSE]
       enter_pes <- heifer_pool$pes[enter_idx,,drop=FALSE]
@@ -951,14 +1026,27 @@ phase2_finalize <- function(state, interim, admit_heifer_ids,
     herd_df$last_meth[i] <- last_row["methane"]
   }
 
-  # ── New AI bulls enter catalogue: 3 per year, one per reliability tier ───────
-  # High (150-300 daughters), Moderate (40-80), Low / young (5-30)
-  new_bull_ndau <- c(sample(150:300,1), sample(40:80,1), sample(5:30,1))
-  new_bull_ndau <- new_bull_ndau[sample(3)]   # shuffle tier order each year
-  for (nb in seq_len(3)) {
+  # ── New AI bulls enter catalogue each generation ──────────────────────────
+  # 5-10 new bulls per year across three reliability tiers:
+  #   Genomic young  (<40 daughters)  → ~30% reliability  → $8
+  #   Sampled        (40-149)         → ~55% reliability  → $15
+  #   Proven         (≥150 daughters) → >80% reliability  → $25
+  n_new_bulls <- sample(N_AI_BULLS_NEW + c(-2L,-1L,0L,1L,2L), 1)  # 5-9
+  n_new_bulls <- max(5L, min(9L, n_new_bulls))
+  # Distribute: ~half genomic (0 dau), ~quarter young proven, ~quarter proven/elite
+  n_genomic  <- round(n_new_bulls * 0.50)
+  n_sampled  <- round(n_new_bulls * 0.25)
+  n_proven   <- n_new_bulls - n_genomic - n_sampled
+  new_bull_ndau <- c(
+    rep(0L,             max(1L, n_genomic)),          # genomic: 0 daughters → ~28% rel
+    sample(100:499, max(1L, n_sampled), replace=TRUE), # young proven → ~65-85% rel
+    sample(500:2000,max(1L, n_proven),  replace=TRUE)  # proven/elite → ~85-90% rel
+  )
+  new_bull_ndau <- new_bull_ndau[sample(length(new_bull_ndau))]  # shuffle
+  for (nb in seq_along(new_bull_ndau)) {
     nb_bv <- sapply(TRAIT_NAMES, function(tr)
       rnorm(1, 0.3*sqrt(Vg[tr]), sqrt(Vg[tr])))
-    res <- estimate_pta(rep(0,N_TRAITS), new_bull_ndau[nb], nb_bv)
+    res <- estimate_bull_pta(new_bull_ndau[nb], nb_bv)
     bid <- paste0("B", formatC(next_bull_id, width=3, flag="0"))
     next_bull_id <- next_bull_id + 1
     kinship_mat <- expand_kinship(kinship_mat, new_id=bid)$mat
@@ -975,7 +1063,7 @@ phase2_finalize <- function(state, interim, admit_heifer_ids,
       dose_price=compute_dose_price(new_bull_ndau[nb], "AI"),
       stringsAsFactors=FALSE))
   }
-  # Cap only AI bulls to N_AI_BULLS; preserve ALL home-raised (Herd) bulls
+  # Keep 10-15 AI bulls total: retire lowest-merit old ones, preserve all Herd bulls
   herd_bulls  <- bull_df %>% filter(source == "Herd")
   ai_bulls_df <- bull_df %>% filter(source == "AI") %>%
     arrange(desc(merit)) %>% slice_head(n=N_AI_BULLS)
@@ -1255,23 +1343,43 @@ ui <- dashboardPage(skin="blue",
       # ── DECISIONS ────────────────────────────────────────────────────────────
       tabItem(tabName="decisions",
         fluidRow(column(12, uiOutput("decisions_gen_banner_ui"))),
+        fluidRow(column(12,
+          div(style="background:#fff8e1;border-left:4px solid #f9a825;
+                     padding:10px 16px;margin-bottom:12px;border-radius:4px;
+                     font-size:0.85em;color:#444;",
+            strong("🧬 Lethal Allele Genotypes"), " — shown in all tables below:",
+            tags$ul(style="margin:6px 0 0 0;padding-left:20px;",
+              tags$li(tags$b("NN"), " — Homozygous normal. No copies of the lethal allele. Safe to use freely."),
+              tags$li(tags$b(style="color:#e65100;", "Nn"),
+                      style="color:#e65100;",
+                      " — Heterozygous carrier. One copy of the lethal allele. ",
+                      span(style="color:#444;font-weight:normal;",
+                        "Carrier × carrier matings produce 25% affected (nn) calves that die at birth.")),
+              tags$li(tags$b(style="color:#c62828;", "nn"),
+                      style="color:#c62828;",
+                      " — Homozygous affected. Two copies — calf does not survive. ",
+                      span(style="color:#444;font-weight:normal;", "These animals are culled immediately."))
+            )
+          )
+        )),
         fluidRow(
           box(title=tagList(icon("mars"), " Step 1 — Choose Bulls to Use"),
               width=7, status="warning", solidHeader=TRUE,
             p(style="font-size:0.85em;color:#555;margin-bottom:8px;",
               strong("Click rows to select"), " the bulls you want to use.",
-              " Matings will be distributed equally across all selected bulls."
+              " Rel % shows how accurate the gPTA is — genomic bulls (~28%) are cheap but uncertain;",
+              " proven sires of sires (>85%) cost more but their PTAs are very reliable."
             ),
             div(style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;",
-              span(style="background:#fde8e8;color:#b91c1c;font-weight:700;
+              span(style="background:#dcfce7;color:#2e7d32;font-weight:700;
                           padding:3px 9px;border-radius:12px;font-size:0.8em;",
-                   "● $25 Proven ≥150 dau"),
-              span(style="background:#fef9c3;color:#92400e;font-weight:700;
+                   "$25 · Sires of sires (500+ dau · >85% rel)"),
+              span(style="background:#fff9c4;color:#e65100;font-weight:700;
                           padding:3px 9px;border-radius:12px;font-size:0.8em;",
-                   "● $15 Sampled 40–149"),
-              span(style="background:#dcfce7;color:#166534;font-weight:700;
+                   "$15 · Young proven (100–499 dau · 65–85% rel)"),
+              span(style="background:#fde8e8;color:#c62828;font-weight:700;
                           padding:3px 9px;border-radius:12px;font-size:0.8em;",
-                   "● $8 Young <40")
+                   "$8 · Genomic (0 dau · ~28% rel)")
             ),
             DTOutput("bull_sel_tbl"),
             br(),
@@ -1287,7 +1395,7 @@ ui <- dashboardPage(skin="blue",
                    "Red = must cull (age ≥ 8)"),
               " — always removed even if not selected.",
               br(),
-              "Also consider: lethal carriers (Nn), low gPTA, old cows."
+              "Also consider culling: carriers (Nn), low Merit, old cows."
             ),
             DTOutput("cull_sel_tbl"),
             br(),
@@ -1301,6 +1409,19 @@ ui <- dashboardPage(skin="blue",
             DTOutput("heifer_sel_tbl"),
             br(),
             uiOutput("heifer_sel_summary_ui")
+          )
+        )),
+        fluidRow(column(12,
+          box(title=tagList(icon("shuffle"), " Step 4 — Assign a Bull to Each Cow (Optional)"),
+              width=12, status="info", solidHeader=TRUE, collapsible=TRUE, collapsed=TRUE,
+            p(style="font-size:0.85em;color:#555;margin-bottom:8px;",
+              "By default matings are distributed equally across all selected bulls.",
+              " Here you can choose exactly which bull mates with each cow.",
+              " Cows left blank will use round-robin."
+            ),
+            uiOutput("mating_matrix_ui"),
+            br(),
+            uiOutput("mating_summary_ui")
           )
         )),
         fluidRow(column(12,
@@ -1474,33 +1595,31 @@ server <- function(input, output, session) {
 
   LAC_DAYS <- 305  # standard lactation length for per-day conversion
 
+  # phe_scale: scale factor for actual production display (1 → 305-day lbs or g/day)
+  # pta_scale: scale factor for gPTA display (1 → 305-day lbs or g/day)
   make_trait_card <- function(st, pta_col, phe_col, label, color,
-                               unit, pop_avg_day, per_day, desc) {
+                               phe_unit, pta_unit, pop_avg_pta,
+                               phe_scale=1, pta_scale=1, desc) {
     if (is.null(st)) return(NULL)
-    herd <- st$herd_df
-    # Actual production
-    phe_vals <- herd[[phe_col]]
-    scale    <- if (per_day) 1/LAC_DAYS else 1
-    phe_mn   <- round(mean(phe_vals, na.rm=TRUE) * scale, 1)
-    phe_sd   <- round(sd(phe_vals,   na.rm=TRUE) * scale, 1)
-    # gPTA (genetic deviation)
-    pta_vals <- herd[[pta_col]]
-    pta_mn   <- round(mean(pta_vals, na.rm=TRUE) * scale, 2)
+    herd    <- st$herd_df
+    phe_mn  <- round(mean(herd[[phe_col]], na.rm=TRUE) * phe_scale, 1)
+    phe_sd  <- round(sd(herd[[phe_col]],   na.rm=TRUE) * phe_scale, 1)
+    pta_mn  <- round(mean(herd[[pta_col]], na.rm=TRUE) * pta_scale, 1)
     pta_sign <- if (pta_mn >= 0) "+" else ""
     div(class="trait-card", style=sprintf("border-top-color:%s;", color),
       div(style="font-size:0.75em;font-weight:700;color:#666;text-transform:uppercase;
                  letter-spacing:0.5px;margin-bottom:2px;", label),
       div(style=sprintf("font-size:1.6em;font-weight:900;color:%s;line-height:1.1;", color),
-          sprintf("%.1f %s", phe_mn, unit)),
+          sprintf("%.1f %s", phe_mn, phe_unit)),
       div(style="font-size:0.72em;color:#888;margin-top:2px;",
-          sprintf("Avg production  |  SD: %.1f %s", phe_sd, unit)),
+          sprintf("Avg production  |  SD: %.1f %s", phe_sd, phe_unit)),
       tags$hr(style="margin:6px 0;border-color:#eee;"),
       div(style="font-size:0.8em;",
         span(style="color:#555;", "Mean gPTA: "),
         span(style=sprintf("font-weight:700;color:%s;", if(pta_mn >= 0) "#1b5e20" else "#b71c1c"),
-             sprintf("%s%.2f %s", pta_sign, pta_mn, unit)),
+             sprintf("%s%.1f %s", pta_sign, pta_mn, pta_unit)),
         span(style="color:#999;font-size:0.88em;",
-             sprintf("  (pop avg %.1f)", pop_avg_day))
+             sprintf("  (pop avg %+.0f)", pop_avg_pta))
       ),
       div(style="font-size:0.72em;color:#888;margin-top:4px;", desc)
     )
@@ -1508,20 +1627,24 @@ server <- function(input, output, session) {
 
   output$trait_card_milk_ui <- renderUI(make_trait_card(sim$state,
     "milk_pta", "last_milk", "🥛 Milk", "#1565c0",
-    "lbs/day", 20000/LAC_DAYS, TRUE,
-    "Higher gPTA = better genetics for daily milk"))
+    phe_unit="lbs/305d", pta_unit="lbs/305d", pop_avg_pta=0,
+    phe_scale=1, pta_scale=1,
+    desc="Higher gPTA = better genetics for milk yield"))
   output$trait_card_fat_ui  <- renderUI(make_trait_card(sim$state,
     "fat_pta",  "last_fat",  "🧈 Fat",  "#f9a825",
-    "lbs/day", 800/LAC_DAYS, TRUE,
-    "Fat content valuable for cheese and butter"))
+    phe_unit="lbs/305d", pta_unit="lbs/305d", pop_avg_pta=0,
+    phe_scale=1, pta_scale=1,
+    desc="Fat content valuable for cheese and butter"))
   output$trait_card_prot_ui <- renderUI(make_trait_card(sim$state,
     "prot_pta", "last_prot", "🧪 Protein", "#2e7d32",
-    "lbs/day", 700/LAC_DAYS, TRUE,
-    "Protein drives fluid milk and product value"))
+    phe_unit="lbs/305d", pta_unit="lbs/305d", pop_avg_pta=0,
+    phe_scale=1, pta_scale=1,
+    desc="Protein drives fluid milk and product value"))
   output$trait_card_meth_ui <- renderUI(make_trait_card(sim$state,
     "meth_pta", "last_meth", "🌿 Methane", "#6a1b9a",
-    "g/day", 450, FALSE,
-    "Lower gPTA = less methane = better for environment"))
+    phe_unit="g/day", pta_unit="g/day", pop_avg_pta=0,
+    phe_scale=1, pta_scale=1,
+    desc="Lower gPTA = less methane = better for environment"))
 
   # ── Herd roster table ─────────────────────────────────────────────────────────
 
@@ -1532,16 +1655,16 @@ server <- function(input, output, session) {
     df <- data.frame(
       ID              = herd$id,
       Age             = herd$age,
-      `Milk (lb/d)`   = round(herd$last_milk / LAC_DAYS, 1),
-      `Fat (lb/d)`    = round(herd$last_fat  / LAC_DAYS, 2),
-      `Prot (lb/d)`   = round(herd$last_prot / LAC_DAYS, 2),
-      `Meth (g/d)`    = round(herd$last_meth, 1),
-      `Milk gPTA`     = round(herd$milk_pta  / LAC_DAYS, 2),
-      `Fat gPTA`      = round(herd$fat_pta   / LAC_DAYS, 3),
-      `Prot gPTA`     = round(herd$prot_pta  / LAC_DAYS, 3),
-      `Meth gPTA`     = round(herd$meth_pta,  1),
+      `Milk (lbs/305d)`  = round(herd$last_milk, 0),
+      `Fat (lbs/305d)`   = round(herd$last_fat,  1),
+      `Prot (lbs/305d)`  = round(herd$last_prot, 1),
+      `Meth (g/d)`       = round(herd$last_meth, 1),
+      `Milk gPTA (lbs)` = round(herd$milk_pta, 0),
+      `Fat gPTA (lbs)`  = round(herd$fat_pta,  1),
+      `Prot gPTA (lbs)` = round(herd$prot_pta, 1),
+      `Meth gPTA (g/d)` = round(herd$meth_pta, 1),
       Merit           = round(herd$merit, 2),
-      Lethal       = ifelse(is.na(herd$lethal) | herd$lethal == "NN", "No", herd$lethal),
+      Lethal       = ifelse(is.na(herd$lethal), "NN", herd$lethal),
       `Must Cull`  = ifelse(herd$age >= MAX_COW_AGE | (!is.na(herd$lethal) & herd$lethal == "nn"), "YES", ""),
       check.names  = FALSE,
       stringsAsFactors = FALSE
@@ -1559,8 +1682,8 @@ server <- function(input, output, session) {
       ) |>
       formatStyle(
         "Lethal",
-        color = styleEqual("YES", "#e65100"),
-        fontWeight = styleEqual("YES", "bold")
+        color      = styleEqual(c("Nn","nn"), c("#e65100","#c62828")),
+        fontWeight = styleEqual(c("Nn","nn"), c("bold","bold"))
       )
   }, server=FALSE)
 
@@ -1571,7 +1694,18 @@ server <- function(input, output, session) {
     content  = function(file) {
       st <- isolate(sim$state)
       req(st)
-      openxlsx::write.xlsx(st$herd_df, file)
+      herd <- st$herd_df
+      # Drop internal PA reliability columns — not useful for students
+      drop_cols <- grep("_pa_rel$", names(herd), value=TRUE)
+      herd <- herd[, setdiff(names(herd), drop_cols)]
+      # Friendly column order
+      keep_order <- c("id","age","sire_id","dam_id","lethal","inbr","merit",
+                      "milk_pta","fat_pta","prot_pta","meth_pta",
+                      "milk_rel","fat_rel","prot_rel","meth_rel",
+                      "last_milk","last_fat","last_prot","last_meth","n_recs")
+      col_order <- c(intersect(keep_order, names(herd)),
+                     setdiff(names(herd), keep_order))
+      openxlsx::write.xlsx(herd[, col_order], file)
     }
   )
 
@@ -1580,7 +1714,10 @@ server <- function(input, output, session) {
     content  = function(file) {
       st <- isolate(sim$state)
       req(st)
-      openxlsx::write.xlsx(st$bull_df, file)
+      bulls <- st$bull_df
+      drop_cols <- grep("_pa_rel$", names(bulls), value=TRUE)
+      bulls <- bulls[, setdiff(names(bulls), drop_cols)]
+      openxlsx::write.xlsx(bulls, file)
     }
   )
 
@@ -1617,14 +1754,15 @@ server <- function(input, output, session) {
   output$bull_sel_tbl <- renderDT({
     bd <- dec$bull_df
     req(bd)
+    rel_pct <- round(bd$milk_rel * 100, 0)
     df <- data.frame(
       ID          = bd$id,
-      Merit       = round(bd$merit,          1),
-      `Milk gPTA` = round(bd$milk_pta,       1),
-      `Fat gPTA`  = round(bd$fat_pta,        1),
-      `Prot gPTA` = round(bd$prot_pta,       1),
-      `Meth gPTA` = round(bd$meth_pta,       1),
-      `Rel %`     = round(bd$milk_rel * 100, 0),
+      Merit       = round(bd$merit,    1),
+      `Milk gPTA (lbs)` = round(bd$milk_pta, 0),
+      `Fat gPTA (lbs)`  = round(bd$fat_pta,  1),
+      `Prot gPTA (lbs)` = round(bd$prot_pta, 1),
+      `Meth gPTA (g/d)` = round(bd$meth_pta, 1),
+      `Rel %`           = rel_pct,
       Daughters   = bd$n_daughters,
       `Dose $`    = sprintf("$%d", round(bd$dose_price)),
       Source      = bd$source,
@@ -1639,9 +1777,12 @@ server <- function(input, output, session) {
       formatStyle(
         "Rel %",
         background = styleColorBar(c(0,100), "#c8e6c9"),
-        backgroundSize = "100% 70%",
-        backgroundRepeat = "no-repeat",
-        backgroundPosition = "center"
+        backgroundSize     = "100% 70%",
+        backgroundRepeat   = "no-repeat",
+        backgroundPosition = "center",
+        # Color-code: red <40%, orange 40-65%, green >65%
+        color = styleInterval(c(40, 65), c("#c62828","#e65100","#2e7d32")),
+        fontWeight = "bold"
       ) |>
       formatStyle(
         "Source",
@@ -1678,18 +1819,14 @@ server <- function(input, output, session) {
     cd <- dec$cull_df
     req(cd)
     df <- data.frame(
-      ID             = cd$id,
-      Age            = cd$age,
-      `Milk (lb/d)`  = round(cd$last_milk / LAC_DAYS, 1),
-      `Fat (lb/d)`   = round(cd$last_fat  / LAC_DAYS, 2),
-      `Prot (lb/d)`  = round(cd$last_prot / LAC_DAYS, 2),
-      `Meth (g/d)`   = round(cd$last_meth, 1),
-      `Milk gPTA`    = round(cd$milk_pta  / LAC_DAYS, 2),
-      `Fat gPTA`     = round(cd$fat_pta   / LAC_DAYS, 3),
-      `Prot gPTA`    = round(cd$prot_pta  / LAC_DAYS, 3),
-      `Meth gPTA`    = round(cd$meth_pta,  1),
-      Merit          = round(cd$merit, 2),
-      Lethal      = ifelse(is.na(cd$lethal) | cd$lethal == "NN", "No", cd$lethal),
+      ID          = cd$id,
+      Age         = cd$age,
+      `Milk gPTA (lbs)` = round(cd$milk_pta, 0),
+      `Fat gPTA (lbs)`  = round(cd$fat_pta,  1),
+      `Prot gPTA (lbs)` = round(cd$prot_pta, 1),
+      `Meth gPTA (g/d)` = round(cd$meth_pta, 1),
+      Merit             = round(cd$merit, 2),
+      Lethal      = ifelse(is.na(cd$lethal), "NN", cd$lethal),
       `Must Cull` = ifelse(cd$must_cull, "YES", "No"),
       check.names = FALSE,
       stringsAsFactors = FALSE
@@ -1707,8 +1844,8 @@ server <- function(input, output, session) {
       ) |>
       formatStyle(
         "Lethal",
-        color = styleEqual("YES", "#e65100"),
-        fontWeight = styleEqual("YES", "bold")
+        color      = styleEqual(c("Nn","nn"), c("#e65100","#c62828")),
+        fontWeight = styleEqual(c("Nn","nn"), c("bold","bold"))
       )
   }, server=FALSE)
 
@@ -1761,12 +1898,12 @@ server <- function(input, output, session) {
       ID          = hf$id,
       Sire        = hf$sire_id,
       Dam         = hf$dam_id,
-      `Milk gPTA` = round(hf$milk_pta / LAC_DAYS, 2),
-      `Fat gPTA`  = round(hf$fat_pta  / LAC_DAYS, 3),
-      `Prot gPTA` = round(hf$prot_pta / LAC_DAYS, 3),
-      `Meth gPTA` = round(hf$meth_pta, 1),
+      `Milk gPTA (lbs)` = round(hf$milk_pta, 0),
+      `Fat gPTA (lbs)`  = round(hf$fat_pta,  1),
+      `Prot gPTA (lbs)` = round(hf$prot_pta, 1),
+      `Meth gPTA (g/d)` = round(hf$meth_pta, 1),
       `Inbr %`    = round(hf$inbr * 100, 2),
-      Lethal      = ifelse(is.na(hf$lethal) | hf$lethal == "NN", "No", hf$lethal),
+      Lethal      = ifelse(is.na(hf$lethal), "NN", hf$lethal),
       check.names = FALSE, stringsAsFactors = FALSE
     )
     datatable(
@@ -1808,6 +1945,127 @@ server <- function(input, output, session) {
     )
   })
 
+  # ── Mating matrix UI (Step 4) — one row per cow ───────────────────────────
+  output$mating_matrix_ui <- renderUI({
+    bd <- dec$bull_df
+    st <- sim$state
+    req(st, bd)
+
+    sel_bulls    <- input$bull_sel_tbl_rows_selected
+    sel_bull_ids <- if (length(sel_bulls) > 0) bd$id[sel_bulls] else character(0)
+    if (length(sel_bull_ids) == 0)
+      return(p(style="color:#888;", "Select bulls in Step 1 first, then assign them here."))
+
+    # Exclude cows already marked for culling (mandatory + student-selected)
+    cd  <- dec$cull_df
+    cull_must <- if (!is.null(cd)) cd$id[cd$must_cull] else character(0)
+    cull_sel  <- input$cull_sel_tbl_rows_selected
+    cull_extra <- if (!is.null(cd) && length(cull_sel) > 0) cd$id[cull_sel] else character(0)
+    cull_ids_now <- unique(c(cull_must, cull_extra))
+    herd <- st$herd_df[!st$herd_df$id %in% cull_ids_now, , drop=FALSE]
+    if (nrow(herd) == 0) return(p(style="color:#888;", "All remaining cows are marked for culling."))
+
+    # Label each bull with ID + Rel% so students can see reliability at a glance
+    bull_labels <- paste0(bd$id[bd$id %in% sel_bull_ids], " (Rel ",
+                          round(bd$milk_rel[bd$id %in% sel_bull_ids]*100), "%)")
+    bull_choices <- c("— round-robin —" = "",
+                      setNames(sel_bull_ids, bull_labels))
+
+    tagList(
+      p(style="font-size:0.82em;color:#666;margin-bottom:6px;",
+        "Assign a specific bull to each cow. Leave blank for round-robin across all selected bulls."),
+      # Header row
+      div(style="display:grid;grid-template-columns:120px 60px 90px 90px 1fr;
+                 gap:4px;font-weight:700;font-size:0.8em;color:#555;
+                 padding:4px 8px;background:#f5f5f5;border-radius:4px;margin-bottom:4px;",
+          span("Cow ID"), span("Age"), span("Net Merit"), span("Rel %"), span("Assign Bull")
+      ),
+      lapply(seq_len(nrow(herd)), function(i) {
+        cow <- herd[i, ]
+        div(style="display:grid;grid-template-columns:120px 60px 90px 90px 1fr;
+                   gap:4px;align-items:center;padding:2px 8px;
+                   background:ifelse(i%%2==0,'#fafafa','white');",
+          span(style="font-size:0.85em;font-family:monospace;", cow$id),
+          span(style="font-size:0.85em;", cow$age),
+          span(style="font-size:0.85em;", round(cow$merit, 1)),
+          span(style="font-size:0.85em;", paste0(round(cow$milk_rel*100), "%")),
+          selectInput(
+            inputId  = paste0("mate_cow_", gsub("[^A-Za-z0-9]", "_", cow$id)),
+            label    = NULL,
+            choices  = bull_choices,
+            selected = "",
+            width    = "100%"
+          )
+        )
+      })
+    )
+  })
+
+  output$mating_summary_ui <- renderUI({
+    bd <- dec$bull_df
+    st <- sim$state
+    req(bd, st)
+    sel_bulls <- input$bull_sel_tbl_rows_selected
+    n_sel <- length(sel_bulls)
+    if (n_sel == 0) return(NULL)
+
+    # Use same cull-filtered herd as the mating matrix
+    cd         <- dec$cull_df
+    cull_must  <- if (!is.null(cd)) cd$id[cd$must_cull] else character(0)
+    cull_sel   <- input$cull_sel_tbl_rows_selected
+    cull_extra <- if (!is.null(cd) && length(cull_sel) > 0) cd$id[cull_sel] else character(0)
+    cull_ids_s <- unique(c(cull_must, cull_extra))
+    herd       <- st$herd_df[!st$herd_df$id %in% cull_ids_s, , drop=FALSE]
+    n_cows    <- nrow(herd)
+    budget    <- BUDGET_PER_COW * n_cows
+    sel_bd    <- bd[bd$id %in% bd$id[sel_bulls], ]
+    avg_rr_price <- mean(sel_bd$dose_price, na.rm=TRUE)
+
+    # Cost per cow: assigned bull price, or round-robin average
+    cow_costs <- sapply(herd$id, function(cid) {
+      key <- paste0("mate_cow_", gsub("[^A-Za-z0-9]", "_", cid))
+      val <- input[[key]]
+      if (!is.null(val) && nchar(val) > 0 && val %in% bd$id)
+        bd$dose_price[bd$id == val]
+      else
+        avg_rr_price
+    })
+
+    total_cost <- sum(cow_costs, na.rm=TRUE)
+    n_assigned <- sum(sapply(herd$id, function(cid) {
+      key <- paste0("mate_cow_", gsub("[^A-Za-z0-9]", "_", cid))
+      val <- input[[key]]
+      !is.null(val) && nchar(val) > 0
+    }))
+    over_budget <- total_cost > budget
+    pct_used    <- round(total_cost / budget * 100)
+
+    tagList(
+      div(style=paste0(
+            "margin-top:10px;padding:10px 14px;border-radius:6px;font-size:0.88em;",
+            "background:", if(over_budget) "#ffebee" else "#e8f5e9", ";",
+            "border-left:4px solid ", if(over_budget) "#c62828" else "#2e7d32", ";"),
+        div(style="display:flex;justify-content:space-between;align-items:center;",
+          div(
+            strong(sprintf("💰 Budget: $%d", round(budget))),
+            span(style="margin-left:16px;",
+                 sprintf("Estimated cost: $%d (%d%%)", round(total_cost), pct_used))
+          ),
+          div(style=paste0("font-weight:700;color:", if(over_budget) "#c62828" else "#2e7d32"),
+              if(over_budget) "⛔ OVER BUDGET" else "✅ Within budget")
+        ),
+        if (over_budget)
+          p(style="margin:6px 0 0 0;color:#c62828;font-weight:600;",
+            sprintf("⚠️ You are $%d over budget. Reassign some cows to cheaper bulls or reduce the number of proven bulls.",
+                    round(total_cost - budget)))
+        else
+          p(style="margin:6px 0 0 0;color:#555;",
+            sprintf("%d of %d cows have a specific bull assigned; %d use round-robin ($%.0f avg).",
+                    n_assigned, n_cows, n_cows - n_assigned, avg_rr_price))
+      )
+    )
+  })
+
   output$advance_tip_ui <- renderUI({
     st <- sim$state
     if (is.null(st)) return(div(style="color:#aaa;", "Initialize simulation first."))
@@ -1840,6 +2098,47 @@ server <- function(input, output, session) {
     extra_ids <- if (length(extra_sel) > 0) cd$id[extra_sel] else character(0)
     cull_ids  <- unique(c(must_ids, extra_ids))
 
+    # ── Herd size guard: enforce ±25% of target ───────────────────────────────
+    n_target   <- st$n_cows_target
+    min_herd   <- floor(n_target   * (1 - HERD_SIZE_FLEX))
+    max_herd   <- ceiling(n_target * (1 + HERD_SIZE_FLEX))
+    n_after_cull <- nrow(st$herd_df) - length(cull_ids)
+    # Count heifers ready to enter (entry_year == next year)
+    n_heifers_ready <- if (!is.null(st$heifer_pool$df) && nrow(st$heifer_pool$df) > 0) {
+      heifer_sel_ids <- if (!is.null(hfd) && nrow(hfd) > 0 &&
+                            length(input$heifer_sel_tbl_rows_selected) > 0)
+                          hfd$id[input$heifer_sel_tbl_rows_selected]
+                        else character(0)
+      length(heifer_sel_ids)
+    } else 0L
+    proj_size <- n_after_cull + n_heifers_ready
+    if (proj_size < min_herd) {
+      showNotification(
+        sprintf("⚠️ Projected herd size (%d) is below the 25%% minimum (%d). Cull fewer cows or select more heifers.",
+                proj_size, min_herd),
+        type="warning", duration=8)
+      return()
+    }
+    if (proj_size > max_herd) {
+      showNotification(
+        sprintf("⚠️ Projected herd size (%d) exceeds the 25%% maximum (%d). Cull more cows or select fewer heifers.",
+                proj_size, max_herd),
+        type="warning", duration=8)
+      return()
+    }
+
+    # ── Build mating plan from Step 4 per-cow assignments ────────────────────
+    herd_ids <- st$herd_df$id
+    mating_plan_vec <- setNames(character(length(herd_ids)), herd_ids)
+    for (cid in herd_ids) {
+      key <- paste0("mate_cow_", gsub("[^A-Za-z0-9]", "_", cid))
+      val <- input[[key]]
+      if (!is.null(val) && nchar(val) > 0 && val %in% bull_ids)
+        mating_plan_vec[cid] <- val
+    }
+    # Only pass non-empty assignments
+    mating_plan_final <- as.list(mating_plan_vec[nchar(mating_plan_vec) > 0])
+
     prog <- Progress$new(session, min=0, max=1)
     prog$set(message="Breeding generation…", value=0.1)
     on.exit(prog$close(), add=TRUE)
@@ -1849,6 +2148,7 @@ server <- function(input, output, session) {
         state        = st,
         use_bull_ids = bull_ids,
         cull_ids     = cull_ids,
+        mating_plan  = if (length(mating_plan_final) > 0) mating_plan_final else NULL,
         budget       = BUDGET_PER_COW * nrow(st$herd_df)
       ),
       error = function(e) {
@@ -1918,26 +2218,34 @@ server <- function(input, output, session) {
     sdf <- st$summary_df
     req(!is.null(sdf) && nrow(sdf) > 0)
     data.frame(
-      Generation = seq_len(nrow(sdf)),
-      Year       = sdf$year,
-      Milk  = sdf$mean_milk_pta,
-      Fat   = sdf$mean_fat_pta,
-      Prot  = sdf$mean_prot_pta,
-      Meth  = sdf$mean_meth_pta,
-      Inbr  = sdf$mean_inbr
+      Generation       = seq_len(nrow(sdf)),
+      Year             = sdf$year,
+      Cows             = sdf$n_cows,
+      `Milk gPTA (lbs)` = round(sdf$mean_milk_pta, 0),
+      `Fat gPTA (lbs)`  = round(sdf$mean_fat_pta,  1),
+      `Prot gPTA (lbs)` = round(sdf$mean_prot_pta, 1),
+      `Meth gPTA g/d`   = round(sdf$mean_meth_pta, 2),
+      `Inbr %`         = round(sdf$mean_inbr * 100, 2),
+      check.names = FALSE
     )
   })
 
   output$genetic_trend_plot <- renderPlot({
     df <- trend_data_r()
     req(df)
-    long <- tidyr::pivot_longer(df, cols=c(Milk,Fat,Prot,Meth),
-                                names_to="Trait", values_to="Value")
+    milk_col <- "Milk gPTA (lbs)"; fat_col <- "Fat gPTA (lbs)"
+    prot_col <- "Prot gPTA (lbs)"; meth_col <- "Meth gPTA g/d"
+    long <- tidyr::pivot_longer(df,
+              cols = c(milk_col, fat_col, prot_col, meth_col),
+              names_to="Trait", values_to="Value")
     ggplot(long, aes(x=Generation, y=Value, color=Trait, group=Trait)) +
       geom_line(linewidth=1.1) +
       geom_point(size=2.5) +
-      scale_color_manual(values=c(Milk="#1565c0",Fat="#f9a825",Prot="#2e7d32",Meth="#6a1b9a")) +
-      labs(title="Genetic Trend by Trait", x="Generation", y="Mean gPTA", color="Trait") +
+      scale_color_manual(values=setNames(
+        c("#1565c0","#f9a825","#2e7d32","#6a1b9a"),
+        c(milk_col, fat_col, prot_col, meth_col))) +
+      labs(title="Genetic Trend by Trait", x="Generation",
+           y="Mean gPTA (per day)", color="Trait") +
       theme_minimal(base_size=13) +
       theme(legend.position="bottom",
             panel.grid.minor=element_blank(),
@@ -1947,7 +2255,7 @@ server <- function(input, output, session) {
   output$inbr_plot <- renderPlot({
     df <- trend_data_r()
     req(df)
-    ggplot(df, aes(x=Generation, y=Inbr*100)) +
+    ggplot(df, aes(x=Generation, y=`Inbr %`)) +
       geom_line(color="#c62828", linewidth=1.1) +
       geom_point(color="#c62828", size=2.5) +
       labs(title="Average Inbreeding (%)", x="Generation", y="Inbreeding (%)") +
@@ -1961,16 +2269,15 @@ server <- function(input, output, session) {
   output$progress_summary_tbl <- renderDT({
     df <- trend_data_r()
     req(df)
-    df$`Inbr %` <- round(df$Inbr * 100, 2)
-    df$Milk  <- round(df$Milk,  1)
-    df$Fat   <- round(df$Fat,   1)
-    df$Prot  <- round(df$Prot,  1)
-    df$Meth  <- round(df$Meth,  1)
-    df$Inbr  <- NULL
-    df$Year  <- NULL
+    df$Year <- NULL
     datatable(df, rownames=FALSE, selection="none",
               options=list(dom="t", pageLength=10),
-              class="compact stripe")
+              class="compact stripe") |>
+      formatStyle("Cows",
+        background         = styleColorBar(range(df$Cows), "#bbdefb"),
+        backgroundSize     = "100% 70%",
+        backgroundRepeat   = "no-repeat",
+        backgroundPosition = "center")
   }, server=FALSE)
 
   # ── Final summary ─────────────────────────────────────────────────────────────
@@ -1985,11 +2292,11 @@ server <- function(input, output, session) {
       h4(icon("flag-checkered"), " Simulation Complete!"),
       p(strong("Genetic progress over all generations:")),
       tags$ul(
-        tags$li(sprintf("Milk:    %+.1f lbs  (%.1f → %.1f)", last$Milk-first$Milk, first$Milk, last$Milk)),
-        tags$li(sprintf("Fat:     %+.1f lbs  (%.1f → %.1f)", last$Fat-first$Fat,   first$Fat,  last$Fat)),
-        tags$li(sprintf("Protein: %+.1f lbs  (%.1f → %.1f)", last$Prot-first$Prot, first$Prot, last$Prot)),
-        tags$li(sprintf("Methane: %+.1f units (%.1f → %.1f)", last$Meth-first$Meth, first$Meth, last$Meth)),
-        tags$li(sprintf("Inbreeding: %.2f%% → %.2f%%", first$Inbr*100, last$Inbr*100))
+        tags$li(sprintf("Milk:    %+.0f lbs/305d  (%.0f → %.0f)", last$`Milk gPTA (lbs)`-first$`Milk gPTA (lbs)`, first$`Milk gPTA (lbs)`, last$`Milk gPTA (lbs)`)),
+        tags$li(sprintf("Fat:     %+.1f lbs/305d  (%.1f → %.1f)", last$`Fat gPTA (lbs)` -first$`Fat gPTA (lbs)`,  first$`Fat gPTA (lbs)`,  last$`Fat gPTA (lbs)`)),
+        tags$li(sprintf("Protein: %+.1f lbs/305d  (%.1f → %.1f)", last$`Prot gPTA (lbs)`-first$`Prot gPTA (lbs)`, first$`Prot gPTA (lbs)`, last$`Prot gPTA (lbs)`)),
+        tags$li(sprintf("Methane: %+.2f g/d   (%.2f → %.2f)", last$`Meth gPTA g/d` -first$`Meth gPTA g/d`,  first$`Meth gPTA g/d`,  last$`Meth gPTA g/d`)),
+        tags$li(sprintf("Inbreeding: %.2f%% → %.2f%%", first$`Inbr %`, last$`Inbr %`))
       )
     )
   })

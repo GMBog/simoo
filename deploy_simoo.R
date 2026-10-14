@@ -10,7 +10,7 @@ library(rsconnect)
 
 # ② Deploy
 rsconnect::deployApp(
-  appDir  = "/Users/GuillermoMartinez/Documents/Talk_and_Courses/Courses/USA/UCD/Proposals/GenApp",
+  appDir  = "/Users/GuillermoMartinez/Documents/MyScripts/MyPackages/simoo",
   appName = "Simoo",
   appTitle = "Simoo — Dairy Herd Genetics Simulator"
 )

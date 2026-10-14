@@ -1,0 +1,10 @@
+name: Simoo
+title: Simoo — Dairy Herd Genetics Simulator
+username: gmbog
+account: gmbog
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 18078652
+bundleId: 12640349
+url: https://gmbog.shinyapps.io/Simoo/
+version: 1
