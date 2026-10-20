@@ -1026,6 +1026,34 @@ phase2_finalize <- function(state, interim, admit_heifer_ids,
     herd_df$last_meth[i] <- last_row["methane"]
   }
 
+  # ── Update bull n_daughters and re-estimate PTAs from herd daughters ────────
+  # Cows entering their first lactation this generation (n_recs == 1) are
+  # daughters that now provide new information for their sire's evaluation.
+  for (brow in seq_len(nrow(bull_df))) {
+    bid      <- bull_df$id[brow]
+    new_daus <- sum(herd_df$sire_id == bid & herd_df$n_recs == 1L, na.rm=TRUE)
+    if (new_daus > 0L) {
+      bull_df$n_daughters[brow] <- bull_df$n_daughters[brow] + new_daus
+      # Re-estimate PTA with updated daughter count using stored true BV
+      tbv_row <- state$bull_true_bv[state$bull_true_bv$id == bid, , drop=FALSE]
+      if (nrow(tbv_row) > 0) {
+        tbv <- as.numeric(tbv_row[1, TRAIT_NAMES])
+        res_b <- estimate_bull_pta(bull_df$n_daughters[brow], tbv)
+        bull_df$milk_pta[brow]  <- res_b$pta["milk"]
+        bull_df$fat_pta[brow]   <- res_b$pta["fat"]
+        bull_df$prot_pta[brow]  <- res_b$pta["protein"]
+        bull_df$meth_pta[brow]  <- res_b$pta["methane"]
+        bull_df$milk_rel[brow]  <- res_b$reliability["milk"]
+        bull_df$fat_rel[brow]   <- res_b$reliability["fat"]
+        bull_df$prot_rel[brow]  <- res_b$reliability["protein"]
+        bull_df$meth_rel[brow]  <- res_b$reliability["methane"]
+        bull_df$merit[brow]     <- compute_merit(res_b$pta)
+      }
+    }
+  }
+  # Recompute dose prices after daughter counts update
+  bull_df$dose_price <- compute_dose_price(bull_df$n_daughters, bull_df$source)
+
   # ── New AI bulls enter catalogue each generation ──────────────────────────
   # 5-10 new bulls per year across three reliability tiers:
   #   Genomic young  (<40 daughters)  → ~30% reliability  → $8
@@ -1043,6 +1071,7 @@ phase2_finalize <- function(state, interim, admit_heifer_ids,
     sample(500:2000,max(1L, n_proven),  replace=TRUE)  # proven/elite → ~85-90% rel
   )
   new_bull_ndau <- new_bull_ndau[sample(length(new_bull_ndau))]  # shuffle
+  bull_true_bv  <- state$bull_true_bv   # local copy; accumulate new entries below
   for (nb in seq_along(new_bull_ndau)) {
     nb_bv <- sapply(TRAIT_NAMES, function(tr)
       rnorm(1, 0.3*sqrt(Vg[tr]), sqrt(Vg[tr])))
@@ -1062,6 +1091,11 @@ phase2_finalize <- function(state, interim, admit_heifer_ids,
       birth_year=bull_birth_years(new_bull_ndau[nb], new_yr),
       dose_price=compute_dose_price(new_bull_ndau[nb], "AI"),
       stringsAsFactors=FALSE))
+    # Store true BV so future daughter updates can re-estimate the PTA
+    new_bv_row <- as.data.frame(t(nb_bv))
+    names(new_bv_row) <- TRAIT_NAMES
+    new_bv_row$id <- bid
+    bull_true_bv <- bind_rows(bull_true_bv, new_bv_row)   # accumulate, not reset
   }
   # Keep 10-15 AI bulls total: retire lowest-merit old ones, preserve all Herd bulls
   herd_bulls  <- bull_df %>% filter(source == "Herd")
@@ -1094,7 +1128,7 @@ phase2_finalize <- function(state, interim, admit_heifer_ids,
     year=new_yr, start_year=state$start_year, n_years=state$n_years,
     herd_df=herd_df, bull_df=bull_df,
     cow_records=cow_records, cow_true_bv=cow_true_bv,
-    bull_true_bv=state$bull_true_bv, summary_df=summary_df,
+    bull_true_bv=bull_true_bv, summary_df=summary_df,
     kinship_mat=kinship_mat,
     next_cow_id=interim$next_cow_id, next_bull_id=next_bull_id,
     lethal_calves=interim$lethal_calves, total_calves=interim$total_calves,
@@ -1344,6 +1378,19 @@ ui <- dashboardPage(skin="blue",
       tabItem(tabName="decisions",
         fluidRow(column(12, uiOutput("decisions_gen_banner_ui"))),
         fluidRow(column(12,
+          div(style="background:#e3f2fd;border-left:4px solid #1565c0;
+                     padding:10px 16px;margin-bottom:12px;border-radius:4px;
+                     display:flex;align-items:center;gap:16px;flex-wrap:wrap;",
+            div(style="font-size:0.88em;color:#0d47a1;font-weight:600;white-space:nowrap;",
+              icon("star"), " My assigned trait:"),
+            selectInput("assigned_trait", label=NULL,
+              choices=c("Milk"="milk", "Fat"="fat", "Protein"="protein", "Methane"="methane"),
+              selected="milk", width="160px"),
+            div(style="font-size:0.82em;color:#555;",
+              "Tables below will sort by this trait's gPTA. For methane, lower gPTA = genetically better (less emissions).")
+          )
+        )),
+        fluidRow(column(12,
           div(style="background:#fff8e1;border-left:4px solid #f9a825;
                      padding:10px 16px;margin-bottom:12px;border-radius:4px;
                      font-size:0.85em;color:#444;",
@@ -1476,6 +1523,25 @@ server <- function(input, output, session) {
 
   sim <- reactiveValues(state = NULL)
   dec <- reactiveValues(bull_df = NULL, cull_df = NULL, heifer_df = NULL)
+
+  # Maps selected trait → 0-based column index for each table + sort direction
+  trait_sort <- reactive({
+    t <- input$assigned_trait
+    if (is.null(t)) t <- "milk"
+    dir <- if (t == "methane") "asc" else "desc"   # methane: lower = better
+    list(
+      trait   = t,
+      dir     = dir,
+      # herd roster: ID(0) Age(1) Milk(2) Fat(3) Prot(4) Meth(5) MilkPTA(6) FatPTA(7) ProtPTA(8) MethPTA(9) Merit(10) Lethal(11) MustCull(12)
+      roster  = switch(t, milk=6L, fat=7L, protein=8L, methane=9L),
+      # cull table: ID(0) Age(1) MilkPTA(2) FatPTA(3) ProtPTA(4) MethPTA(5) Merit(6) Lethal(7) MustCull(8)
+      cull    = switch(t, milk=2L, fat=3L, protein=4L, methane=5L),
+      # heifer table: ID(0) Sire(1) Dam(2) MilkPTA(3) FatPTA(4) ProtPTA(5) MethPTA(6) Inbr(7) Lethal(8)
+      heifer  = switch(t, milk=3L, fat=4L, protein=5L, methane=6L),
+      # bull table: ID(0) Merit(1) MilkPTA(2) FatPTA(3) ProtPTA(4) MethPTA(5) Rel(6) Daughters(7) Dose(8) Source(9)
+      bull    = switch(t, milk=2L, fat=3L, protein=4L, methane=5L)
+    )
+  })
 
   # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -1652,6 +1718,7 @@ server <- function(input, output, session) {
     st <- sim$state
     req(st)
     herd <- st$herd_df
+    ts   <- trait_sort()
     df <- data.frame(
       ID              = herd$id,
       Age             = herd$age,
@@ -1671,7 +1738,7 @@ server <- function(input, output, session) {
     )
     datatable(
       df, rownames=FALSE, selection="none",
-      options=list(pageLength=15, dom="ftp", order=list(list(1,"desc"))),
+      options=list(pageLength=15, dom="ftp", order=list(list(ts$roster, ts$dir))),
       class="compact stripe"
     ) |>
       formatStyle(
@@ -1715,6 +1782,8 @@ server <- function(input, output, session) {
       st <- isolate(sim$state)
       req(st)
       bulls <- st$bull_df
+      # Recompute dose price from current daughter counts (stored value may be stale)
+      bulls$dose_price <- compute_dose_price(bulls$n_daughters, bulls$source)
       drop_cols <- grep("_pa_rel$", names(bulls), value=TRUE)
       bulls <- bulls[, setdiff(names(bulls), drop_cols)]
       openxlsx::write.xlsx(bulls, file)
@@ -1754,6 +1823,7 @@ server <- function(input, output, session) {
   output$bull_sel_tbl <- renderDT({
     bd <- dec$bull_df
     req(bd)
+    ts      <- trait_sort()
     rel_pct <- round(bd$milk_rel * 100, 0)
     df <- data.frame(
       ID          = bd$id,
@@ -1771,7 +1841,7 @@ server <- function(input, output, session) {
     )
     datatable(
       df, rownames=FALSE, selection="multiple",
-      options=list(pageLength=15, dom="t", order=list(list(1,"desc"))),
+      options=list(pageLength=15, dom="t", order=list(list(ts$bull, ts$dir))),
       class="compact stripe hover"
     ) |>
       formatStyle(
@@ -1818,6 +1888,7 @@ server <- function(input, output, session) {
   output$cull_sel_tbl <- renderDT({
     cd <- dec$cull_df
     req(cd)
+    ts <- trait_sort()
     df <- data.frame(
       ID          = cd$id,
       Age         = cd$age,
@@ -1833,7 +1904,7 @@ server <- function(input, output, session) {
     )
     datatable(
       df, rownames=FALSE, selection="multiple",
-      options=list(pageLength=20, dom="ftp", order=list(list(1,"desc"))),
+      options=list(pageLength=20, dom="ftp", order=list(list(ts$cull, ts$dir))),
       class="compact stripe hover"
     ) |>
       formatStyle(
@@ -1906,10 +1977,11 @@ server <- function(input, output, session) {
       Lethal      = ifelse(is.na(hf$lethal), "NN", hf$lethal),
       check.names = FALSE, stringsAsFactors = FALSE
     )
+    ts <- trait_sort()
     datatable(
       df, rownames=FALSE, selection="multiple",
       options=list(pageLength=20, dom="t",
-                   order=list(list(3, "desc"))),   # sort by Milk gPTA desc
+                   order=list(list(ts$heifer, ts$dir))),
       class="compact stripe hover"
     ) |>
       formatStyle(
@@ -1964,6 +2036,12 @@ server <- function(input, output, session) {
     cull_ids_now <- unique(c(cull_must, cull_extra))
     herd <- st$herd_df[!st$herd_df$id %in% cull_ids_now, , drop=FALSE]
     if (nrow(herd) == 0) return(p(style="color:#888;", "All remaining cows are marked for culling."))
+
+    # Sort cows by assigned trait gPTA (best first; methane: lowest first)
+    ts       <- trait_sort()
+    pta_col  <- switch(ts$trait, milk="milk_pta", fat="fat_pta", protein="prot_pta", methane="meth_pta")
+    sort_idx <- order(herd[[pta_col]], decreasing = (ts$dir == "desc"))
+    herd     <- herd[sort_idx, , drop=FALSE]
 
     # Label each bull with ID + Rel% so students can see reliability at a glance
     bull_labels <- paste0(bd$id[bd$id %in% sel_bull_ids], " (Rel ",
