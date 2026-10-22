@@ -60,7 +60,7 @@ library(openxlsx)
 TRAIT_NAMES   <- c("milk", "fat", "protein", "methane")
 N_TRAITS      <- 4
 pop_mean      <- c(milk=20000, fat=800,  protein=700,  methane=450)
-h2            <- c(milk=0.20,  fat=0.20, protein=0.20, methane=0.30)
+h2            <- c(milk=0.20,  fat=0.20, protein=0.20, methane=0.40)
 pheno_sd      <- c(milk=3200,  fat=120,  protein=80,   methane=15)
 repeatability <- c(milk=0.50,  fat=0.55, protein=0.55, methane=0.40)
 Vp            <- pheno_sd^2
@@ -68,10 +68,10 @@ Vg            <- h2 * Vp;   names(Vg)  <- TRAIT_NAMES
 Vpe           <- (repeatability - h2) * Vp;  names(Vpe) <- TRAIT_NAMES
 Vte           <- (1 - repeatability)  * Vp;  names(Vte) <- TRAIT_NAMES
 gen_cor <- matrix(c(
-   1.00, 0.40, 0.83, 0.28,
-   0.40, 1.00, 0.60, 0.62,
-   0.83, 0.60, 1.00, 0.40,
-   0.28, 0.62, 0.40, 1.00),
+   1.00, 0.50, 0.85, 0.25,
+   0.50, 1.00, 0.60, 0.62,
+   0.85, 0.60, 1.00, 0.40,
+   0.25, 0.62, 0.40, 1.00),
   nrow=4, byrow=TRUE, dimnames=list(TRAIT_NAMES, TRAIT_NAMES))
 INBR_DEPR     <- c(milk=-200, fat=0,    protein=0,    methane=-0.5)
 # Methane weight is NEGATIVE: lower CH4 emission → higher merit
@@ -1492,11 +1492,15 @@ ui <- dashboardPage(skin="blue",
         )),
         fluidRow(
           box(title="Genetic Trend — Mean gPTA per Trait",
-              width=12, status="primary", solidHeader=TRUE,
+              width=6, status="primary", solidHeader=TRUE,
+            plotOutput("genetic_trend_plot", height="400px")
+          ),
+          box(title="Phenotypic Production — Herd Mean per Generation",
+              width=6, status="success", solidHeader=TRUE,
             p(style="font-size:0.82em;color:#555;margin-bottom:4px;",
-              "Solid line = mean gPTA (estimated). Dashed = true mean BV (shown when simulation ends). ",
-              "Each panel has its own Y-axis. Methane: lower is better."),
-            plotOutput("genetic_trend_plot", height="380px")
+              "Mean 305-day production recorded in the herd each generation. ",
+              "Genetic gain should translate into higher milk/fat/protein and lower methane over time."),
+            plotOutput("pheno_trend_plot", height="400px")
           )
         ),
         fluidRow(
@@ -2296,14 +2300,18 @@ server <- function(input, output, session) {
     sdf <- st$summary_df
     req(!is.null(sdf) && nrow(sdf) > 0)
     data.frame(
-      Generation       = seq_len(nrow(sdf)),
-      Year             = sdf$year,
-      Cows             = sdf$n_cows,
+      Generation        = seq_len(nrow(sdf)),
+      Year              = sdf$year,
+      Cows              = sdf$n_cows,
       `Milk gPTA (lbs)` = round(sdf$mean_milk_pta, 0),
       `Fat gPTA (lbs)`  = round(sdf$mean_fat_pta,  1),
       `Prot gPTA (lbs)` = round(sdf$mean_prot_pta, 1),
       `Meth gPTA g/d`   = round(sdf$mean_meth_pta, 2),
-      `Inbr %`         = round(sdf$mean_inbr * 100, 2),
+      `Milk Prod (lbs)` = round(sdf$mean_milk_phe, 0),
+      `Fat Prod (lbs)`  = round(sdf$mean_fat_phe,  1),
+      `Prot Prod (lbs)` = round(sdf$mean_prot_phe, 1),
+      `Meth Prod (g/d)` = round(sdf$mean_meth_phe, 1),
+      `Inbr %`          = round(sdf$mean_inbr * 100, 2),
       check.names = FALSE
     )
   })
@@ -2311,23 +2319,60 @@ server <- function(input, output, session) {
   output$genetic_trend_plot <- renderPlot({
     df <- trend_data_r()
     req(df)
-    milk_col <- "Milk gPTA (lbs)"; fat_col <- "Fat gPTA (lbs)"
-    prot_col <- "Prot gPTA (lbs)"; meth_col <- "Meth gPTA g/d"
+    trait_colors <- c(
+      "Milk gPTA (lbs)"="#1565c0",
+      "Fat gPTA (lbs)" ="#f9a825",
+      "Prot gPTA (lbs)"="#2e7d32",
+      "Meth gPTA g/d"  ="#6a1b9a")
     long <- tidyr::pivot_longer(df,
-              cols = c(milk_col, fat_col, prot_col, meth_col),
+              cols = names(trait_colors),
               names_to="Trait", values_to="Value")
+    long$Trait <- factor(long$Trait, levels=names(trait_colors))
     ggplot(long, aes(x=Generation, y=Value, color=Trait, group=Trait)) +
-      geom_line(linewidth=1.1) +
-      geom_point(size=2.5) +
-      scale_color_manual(values=setNames(
-        c("#1565c0","#f9a825","#2e7d32","#6a1b9a"),
-        c(milk_col, fat_col, prot_col, meth_col))) +
-      labs(title="Genetic Trend by Trait", x="Generation",
-           y="Mean gPTA (per day)", color="Trait") +
+      geom_hline(yintercept=0, linetype="dashed", color="grey60", linewidth=0.6) +
+      geom_line(linewidth=1.2) +
+      geom_point(size=2.8) +
+      scale_color_manual(values=trait_colors) +
+      scale_x_continuous(breaks=seq_len(max(df$Generation))) +
+      facet_wrap(~Trait, scales="free_y", ncol=2) +
+      labs(title="Genetic Trend — Mean gPTA per Trait",
+           subtitle="Each panel has its own Y-axis so small changes are visible. Methane: lower is better.",
+           x="Generation", y="Mean gPTA") +
       theme_minimal(base_size=13) +
-      theme(legend.position="bottom",
+      theme(legend.position="none",
             panel.grid.minor=element_blank(),
-            plot.title=element_text(face="bold", color="#002855"))
+            strip.text=element_text(face="bold", size=12),
+            plot.title=element_text(face="bold", color="#002855"),
+            plot.subtitle=element_text(color="#555", size=10))
+  })
+
+  output$pheno_trend_plot <- renderPlot({
+    df <- trend_data_r()
+    req(df)
+    trait_colors <- c(
+      "Milk Prod (lbs)"="#1565c0",
+      "Fat Prod (lbs)" ="#f9a825",
+      "Prot Prod (lbs)"="#2e7d32",
+      "Meth Prod (g/d)"="#6a1b9a")
+    long <- tidyr::pivot_longer(df,
+              cols = names(trait_colors),
+              names_to="Trait", values_to="Value")
+    long$Trait <- factor(long$Trait, levels=names(trait_colors))
+    ggplot(long, aes(x=Generation, y=Value, color=Trait, group=Trait)) +
+      geom_line(linewidth=1.2) +
+      geom_point(size=2.8) +
+      scale_color_manual(values=trait_colors) +
+      scale_x_continuous(breaks=seq_len(max(df$Generation))) +
+      facet_wrap(~Trait, scales="free_y", ncol=2) +
+      labs(title="Phenotypic Production — Herd Mean per Generation",
+           subtitle="Mean 305-day production of cows in the herd. Reflects genetics + environment.",
+           x="Generation", y="Mean Production") +
+      theme_minimal(base_size=13) +
+      theme(legend.position="none",
+            panel.grid.minor=element_blank(),
+            strip.text=element_text(face="bold", size=12),
+            plot.title=element_text(face="bold", color="#002855"),
+            plot.subtitle=element_text(color="#555", size=10))
   })
 
   output$inbr_plot <- renderPlot({
