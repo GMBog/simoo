@@ -68,9 +68,9 @@ Vg            <- h2 * Vp;   names(Vg)  <- TRAIT_NAMES
 Vpe           <- (repeatability - h2) * Vp;  names(Vpe) <- TRAIT_NAMES
 Vte           <- (1 - repeatability)  * Vp;  names(Vte) <- TRAIT_NAMES
 gen_cor <- matrix(c(
-   1.00, 0.70, 0.90, 0.25,
-   0.70, 1.00, 0.80, 0.62,
-   0.90, 0.80, 1.00, 0.40,
+   1.00, 0.50, 0.85, 0.25,
+   0.50, 1.00, 0.60, 0.62,
+   0.85, 0.60, 1.00, 0.40,
    0.25, 0.62, 0.40, 1.00),
   nrow=4, byrow=TRUE, dimnames=list(TRAIT_NAMES, TRAIT_NAMES))
 INBR_DEPR     <- c(milk=-200, fat=0,    protein=0,    methane=-0.5)
