@@ -62,15 +62,15 @@ N_TRAITS      <- 4
 pop_mean      <- c(milk=20000, fat=800,  protein=700,  methane=450)
 h2            <- c(milk=0.20,  fat=0.20, protein=0.20, methane=0.40)
 pheno_sd      <- c(milk=3200,  fat=120,  protein=80,   methane=15)
-repeatability <- c(milk=0.50,  fat=0.55, protein=0.55, methane=0.40)
+repeatability <- c(milk=0.50,  fat=0.55, protein=0.55, methane=0.50)
 Vp            <- pheno_sd^2
 Vg            <- h2 * Vp;   names(Vg)  <- TRAIT_NAMES
 Vpe           <- (repeatability - h2) * Vp;  names(Vpe) <- TRAIT_NAMES
 Vte           <- (1 - repeatability)  * Vp;  names(Vte) <- TRAIT_NAMES
 gen_cor <- matrix(c(
-   1.00, 0.50, 0.85, 0.25,
-   0.50, 1.00, 0.60, 0.62,
-   0.85, 0.60, 1.00, 0.40,
+   1.00, 0.70, 0.90, 0.25,
+   0.70, 1.00, 0.80, 0.62,
+   0.90, 0.80, 1.00, 0.40,
    0.25, 0.62, 0.40, 1.00),
   nrow=4, byrow=TRUE, dimnames=list(TRAIT_NAMES, TRAIT_NAMES))
 INBR_DEPR     <- c(milk=-200, fat=0,    protein=0,    methane=-0.5)
@@ -198,7 +198,7 @@ generate_record <- function(bv, pe, inbr=0) {
   phe
 }
 
-estimate_pta <- function(rec_mean, n_recs, true_bv, pa_rel=NULL) {
+estimate_pta <- function(rec_mean, n_recs, true_bv=NULL, pa_rel=NULL) {
   # Effective record count from own records (methane scaled by recording fraction)
   eff_n            <- rep(n_recs, N_TRAITS)
   names(eff_n)     <- TRAIT_NAMES
@@ -213,12 +213,31 @@ estimate_pta <- function(rec_mean, n_recs, true_bv, pa_rel=NULL) {
     eff_n <- eff_n + n_pa_equiv
   }
 
-  r2       <- (eff_n*h2) / (eff_n*h2 + (1-h2))
-  true_pta <- true_bv / 2
-  noise    <- sapply(seq_along(TRAIT_NAMES), function(i)
-    rnorm(1, 0, sqrt(1-r2[i]) * sqrt(Vg[i]) / 2))
-  names(noise) <- TRAIT_NAMES
-  list(pta=r2*true_pta+noise, reliability=r2)
+  r2 <- (eff_n*h2) / (eff_n*h2 + (1-h2))
+
+  # PTA is estimated directly from phenotypic records (BLUP-style):
+  #   PTA = r² × (mean_record - pop_mean) / 2
+  # The /2 converts phenotypic deviation to BV scale (parent-to-offspring).
+  # The randomness comes from the stochastic records themselves, NOT from
+  # re-drawing noise here — re-drawing noise each call caused artificial
+  # generation-to-generation PTA fluctuations even with unchanged records.
+  if (n_recs > 0) {
+    adj <- (rec_mean - pop_mean) / 2
+    names(adj) <- TRAIT_NAMES
+    pta <- r2 * adj
+  } else {
+    # No own records: fall back to PA estimate (rec_mean unused)
+    # If true_bv supplied (founders / heifers at init), add small genomic noise
+    if (!is.null(true_bv)) {
+      noise <- sapply(seq_along(TRAIT_NAMES), function(i)
+        rnorm(1, 0, sqrt(1 - r2[i]) * sqrt(Vg[i]) / 2))
+      names(noise) <- TRAIT_NAMES
+      pta <- r2 * (true_bv / 2) + noise
+    } else {
+      pta <- setNames(rep(0, N_TRAITS), TRAIT_NAMES)
+    }
+  }
+  list(pta=pta, reliability=r2)
 }
 
 # ── Bull-specific PTA estimation ──────────────────────────────────────────────
@@ -1495,11 +1514,11 @@ ui <- dashboardPage(skin="blue",
               width=6, status="primary", solidHeader=TRUE,
             plotOutput("genetic_trend_plot", height="400px")
           ),
-          box(title="Phenotypic Production — Herd Mean per Generation",
+          box(title="Total Herd Production per Generation",
               width=6, status="success", solidHeader=TRUE,
             p(style="font-size:0.82em;color:#555;margin-bottom:4px;",
-              "Mean 305-day production recorded in the herd each generation. ",
-              "Genetic gain should translate into higher milk/fat/protein and lower methane over time."),
+              "Total 305-day production for the whole herd. Reducing herd size reduces totals even if genetics improve. ",
+              "Methane shown as CO2-equivalent tonnes/year (CH4 × GWP 25)."),
             plotOutput("pheno_trend_plot", height="400px")
           )
         ),
@@ -2299,19 +2318,21 @@ server <- function(input, output, session) {
     req(st)
     sdf <- st$summary_df
     req(!is.null(sdf) && nrow(sdf) > 0)
+    # Total herd production: mean × n_cows
+    # Methane CO2-equivalent tonnes/yr: mean(g/d) × 365 d × n_cows / 1e6 g/t × 25 GWP
     data.frame(
-      Generation        = seq_len(nrow(sdf)),
-      Year              = sdf$year,
-      Cows              = sdf$n_cows,
-      `Milk gPTA (lbs)` = round(sdf$mean_milk_pta, 0),
-      `Fat gPTA (lbs)`  = round(sdf$mean_fat_pta,  1),
-      `Prot gPTA (lbs)` = round(sdf$mean_prot_pta, 1),
-      `Meth gPTA g/d`   = round(sdf$mean_meth_pta, 2),
-      `Milk Prod (lbs)` = round(sdf$mean_milk_phe, 0),
-      `Fat Prod (lbs)`  = round(sdf$mean_fat_phe,  1),
-      `Prot Prod (lbs)` = round(sdf$mean_prot_phe, 1),
-      `Meth Prod (g/d)` = round(sdf$mean_meth_phe, 1),
-      `Inbr %`          = round(sdf$mean_inbr * 100, 2),
+      Generation           = seq_len(nrow(sdf)),
+      Year                 = sdf$year,
+      Cows                 = sdf$n_cows,
+      `Milk gPTA (lbs)`    = round(sdf$mean_milk_pta, 0),
+      `Fat gPTA (lbs)`     = round(sdf$mean_fat_pta,  1),
+      `Prot gPTA (lbs)`    = round(sdf$mean_prot_pta, 1),
+      `Meth gPTA g/d`      = round(sdf$mean_meth_pta, 2),
+      `Total Milk (lbs)`   = round(sdf$mean_milk_phe * sdf$n_cows, 0),
+      `Total Fat (lbs)`    = round(sdf$mean_fat_phe  * sdf$n_cows, 1),
+      `Total Prot (lbs)`   = round(sdf$mean_prot_phe * sdf$n_cows, 1),
+      `CH4 CO2eq (t/yr)`   = round(sdf$mean_meth_phe * 365 * sdf$n_cows / 1e6 * 25, 2),
+      `Inbr %`             = round(sdf$mean_inbr * 100, 2),
       check.names = FALSE
     )
   })
@@ -2350,10 +2371,10 @@ server <- function(input, output, session) {
     df <- trend_data_r()
     req(df)
     trait_colors <- c(
-      "Milk Prod (lbs)"="#1565c0",
-      "Fat Prod (lbs)" ="#f9a825",
-      "Prot Prod (lbs)"="#2e7d32",
-      "Meth Prod (g/d)"="#6a1b9a")
+      "Total Milk (lbs)" ="#1565c0",
+      "Total Fat (lbs)"  ="#f9a825",
+      "Total Prot (lbs)" ="#2e7d32",
+      "CH4 CO2eq (t/yr)" ="#6a1b9a")
     long <- tidyr::pivot_longer(df,
               cols = names(trait_colors),
               names_to="Trait", values_to="Value")
@@ -2364,9 +2385,9 @@ server <- function(input, output, session) {
       scale_color_manual(values=trait_colors) +
       scale_x_continuous(breaks=seq_len(max(df$Generation))) +
       facet_wrap(~Trait, scales="free_y", ncol=2) +
-      labs(title="Phenotypic Production — Herd Mean per Generation",
-           subtitle="Mean 305-day production of cows in the herd. Reflects genetics + environment.",
-           x="Generation", y="Mean Production") +
+      labs(title="Total Herd Production per Generation",
+           subtitle="Total 305-day production for the whole herd. Herd size changes affect totals. Methane shown as CO2-equivalent tonnes/year (GWP = 25).",
+           x="Generation", y="Total") +
       theme_minimal(base_size=13) +
       theme(legend.position="none",
             panel.grid.minor=element_blank(),
