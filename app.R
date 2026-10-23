@@ -1220,7 +1220,9 @@ ui <- dashboardPage(skin="blue",
   ),
 
   dashboardBody(
-    tags$head(tags$style(HTML("
+    tags$head(
+      tags$meta(name="viewport", content="width=device-width, initial-scale=1.0"),
+      tags$style(HTML("
       .skin-blue .main-header .logo,.skin-blue .main-header .navbar
         { background-color:#002855; }
       .skin-blue .main-sidebar { background-color:#1a1a2e; }
@@ -1257,6 +1259,70 @@ ui <- dashboardPage(skin="blue",
       /* ── Save box ─────────────────────────────────────────────── */
       .save-box { background:#fffbf0; border:1px solid #e8d88a;
                   border-radius:9px; padding:14px; }
+
+      /* ── Mobile / tablet responsiveness ──────────────────────── */
+
+      /* Make all DataTables scroll horizontally instead of clipping */
+      .dataTables_wrapper { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+      .dataTables_scrollBody { overflow-x: auto !important; }
+      table.dataTable { min-width: 400px; }
+
+      /* Smaller header logo text on small screens */
+      @media (max-width: 768px) {
+        /* Sidebar collapses — push content to full width */
+        .content-wrapper, .main-footer { margin-left: 0 !important; }
+        .main-sidebar { display: none; }
+
+        /* Stack flex layouts vertically */
+        .gen-banner  { flex-direction: column; gap: 8px; text-align: center; }
+        .advance-area { flex-direction: column; gap: 8px; }
+        .gen-banner .gen-num { font-size: 1.6em; }
+
+        /* Trait cards: 2 per row on phone */
+        .trait-card { min-height: 100px; padding: 10px 12px; }
+        .trait-card .tc-val { font-size: 1.3em; }
+
+        /* Boxes: full width on small screens */
+        .col-sm-1, .col-sm-2, .col-sm-3, .col-sm-4,
+        .col-sm-5, .col-sm-6, .col-sm-7, .col-sm-8,
+        .col-sm-9, .col-sm-10, .col-sm-11, .col-sm-12 {
+          width: 100% !important;
+          float: none !important;
+        }
+
+        /* Reduce padding in boxes */
+        .box { margin-bottom: 10px; }
+        .box-body { padding: 8px; }
+
+        /* Header */
+        .main-header .logo { font-size: 14px !important; }
+
+        /* Smaller text in tables */
+        table.dataTable td, table.dataTable th { font-size: 12px; padding: 4px 6px; }
+
+        /* Input controls: full width */
+        .selectize-control, .shiny-input-container { width: 100% !important; max-width: 100%; }
+
+        /* Download buttons: full width */
+        .btn { width: 100%; margin-bottom: 6px; }
+
+        /* Nav pills / tab buttons */
+        .nav-pills > li > a { padding: 6px 10px; font-size: 13px; }
+      }
+
+      @media (max-width: 480px) {
+        /* Very small phones: shrink further */
+        .trait-card .tc-val { font-size: 1.1em; }
+        .gen-banner .gen-num { font-size: 1.3em; }
+        h3 { font-size: 1em; }
+        table.dataTable td, table.dataTable th { font-size: 11px; padding: 3px 4px; }
+      }
+
+      /* iPad / tablet: sidebar stays but content adapts */
+      @media (min-width: 769px) and (max-width: 1024px) {
+        .dataTables_wrapper { overflow-x: auto; }
+        table.dataTable td, table.dataTable th { font-size: 13px; }
+      }
     "))),
 
     tabItems(
