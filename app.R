@@ -1352,11 +1352,11 @@ ui <- dashboardPage(skin="blue",
               column(6, numericInput("n_cows_target", "Herd Size",
                                     value=30, min=10, max=500, step=5)),
               column(6, numericInput("n_years", "Generations",
-                                    value=5, min=1, max=20))
+                                    value=6, min=1, max=20))
             ),
             fluidRow(
               column(6, numericInput("seed", "Random Seed",
-                                    value=42, min=1, max=9999)),
+                                    value=1, min=1, max=9999)),
               column(6, numericInput("start_year", "Start Year",
                                     value=1, min=1, max=100))
             ),
@@ -2498,66 +2498,6 @@ server <- function(input, output, session) {
     if (is.null(df) || nrow(df) < 2) return(NULL)
     first <- df[1,]; last <- df[nrow(df),]
 
-    # ── TBV reveal: match bull_df PTAs against bull_true_bv ──────────────────
-    tbv_table <- tryCatch({
-      btbv <- st$bull_true_bv
-      bdf  <- st$bull_df
-      if (!is.null(btbv) && nrow(btbv) > 0 && !is.null(bdf) && nrow(bdf) > 0) {
-        common_ids <- intersect(bdf$id, btbv$id)
-        if (length(common_ids) > 0) {
-          rows <- lapply(common_ids, function(bid) {
-            b  <- bdf[bdf$id == bid, ]
-            bv <- btbv[btbv$id == bid, ]
-            tags$tr(
-              tags$td(style="padding:4px 8px;font-weight:600;color:#002855;", bid),
-              tags$td(style="padding:4px 8px;text-align:right;",
-                      sprintf("%+.0f", b$pta_milk)),
-              tags$td(style="padding:4px 8px;text-align:right;color:#1b5e20;font-weight:700;",
-                      sprintf("%+.0f", bv$milk / 2)),   # true PTA = TBV / 2
-              tags$td(style="padding:4px 8px;text-align:right;",
-                      sprintf("%+.1f", b$pta_fat)),
-              tags$td(style="padding:4px 8px;text-align:right;color:#1b5e20;font-weight:700;",
-                      sprintf("%+.1f", bv$fat / 2)),
-              tags$td(style="padding:4px 8px;text-align:right;",
-                      sprintf("%+.1f", b$pta_protein)),
-              tags$td(style="padding:4px 8px;text-align:right;color:#1b5e20;font-weight:700;",
-                      sprintf("%+.1f", bv$protein / 2)),
-              tags$td(style="padding:4px 8px;text-align:right;",
-                      sprintf("%+.2f", b$pta_methane)),
-              tags$td(style="padding:4px 8px;text-align:right;color:#1b5e20;font-weight:700;",
-                      sprintf("%+.2f", bv$methane / 2))
-            )
-          })
-          tagList(
-            h4(icon("magnifying-glass"), " True Breeding Values Revealed!",
-               style="margin-top:24px;color:#002855;"),
-            p(style="font-size:0.88em;color:#555;",
-              "Compare the PTAs you saw during the simulation to the true PTAs (= TBV ÷ 2). ",
-              "Young bulls with few daughters show the largest discrepancies — this is ",
-              strong("winner's curse"), " in action."),
-            tags$div(style="overflow-x:auto;",
-              tags$table(style="width:100%;border-collapse:collapse;font-size:0.87em;",
-                tags$thead(
-                  tags$tr(style="background:#002855;color:white;",
-                    tags$th(style="padding:6px 8px;text-align:left;",  "Bull"),
-                    tags$th(style="padding:6px 8px;text-align:right;", "Milk PTA"),
-                    tags$th(style="padding:6px 8px;text-align:right;background:#1b5e20;", "Milk true PTA"),
-                    tags$th(style="padding:6px 8px;text-align:right;", "Fat PTA"),
-                    tags$th(style="padding:6px 8px;text-align:right;background:#1b5e20;", "Fat true PTA"),
-                    tags$th(style="padding:6px 8px;text-align:right;", "Prot PTA"),
-                    tags$th(style="padding:6px 8px;text-align:right;background:#1b5e20;", "Prot true PTA"),
-                    tags$th(style="padding:6px 8px;text-align:right;", "CH₄ PTA"),
-                    tags$th(style="padding:6px 8px;text-align:right;background:#1b5e20;", "CH₄ true PTA")
-                  )
-                ),
-                tags$tbody(rows)
-              )
-            )
-          )
-        }
-      }
-    }, error = function(e) NULL)
-
     div(class="save-box", style="border-color:#002855;margin-top:20px;",
       h4(icon("flag-checkered"), " Simulation Complete!"),
       p(strong(sprintf("Genetic progress over %d generations:", st$n_years))),
@@ -2576,8 +2516,7 @@ server <- function(input, output, session) {
                         first$`Meth gPTA g/d`, last$`Meth gPTA g/d`)),
         tags$li(sprintf("Inbreeding: %.2f%% → %.2f%%",
                         first$`Inbr %`, last$`Inbr %`))
-      ),
-      tbv_table
+      )
     )
   })
 
