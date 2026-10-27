@@ -2,6 +2,11 @@
 #  Simoo — Dairy Herd Simulation  v5  (formerly DairyHerdSim)
 #  ANG107 Genetics and Breeding Lab  |  UC Davis
 #
+#  New in v6:
+#   • Async computation (future + promises): Start Simulation and Advance
+#     Generation now run in background workers — no session blocks any other
+#   • Buttons disabled while computing to prevent double-clicks
+#
 #  New in v5:
 #   • Simulation ends at the user-defined number of generations (not fixed at 9)
 #   • Final summary on Progress tab: congratulations banner, gen 1 vs final
@@ -35,18 +40,25 @@
 #           or upload folder to shinyapps.io
 #
 #  Packages:
-#  install.packages(c("shiny","shinydashboard","AlphaSimR",
-#                     "ggplot2","dplyr","tidyr","DT","openxlsx"))
+#  install.packages(c("shiny","shinydashboard","shinyjs","future","promises",
+#                     "AlphaSimR","ggplot2","dplyr","tidyr","DT","openxlsx"))
 # =============================================================================
 
 library(shiny)
 library(shinydashboard)
+library(shinyjs)
+library(future)
+library(promises)
 library(AlphaSimR)
 library(ggplot2)
 library(dplyr)
 library(tidyr)
 library(DT)
 library(openxlsx)
+
+# Each student's heavy computation runs in its own background R worker,
+# so no session blocks any other.
+plan(multisession)
 
 
 # ─── BIOLOGICAL PARAMETERS ───────────────────────────────────────────────────
@@ -1219,6 +1231,7 @@ ui <- dashboardPage(skin="blue",
   ),
 
   dashboardBody(
+    useShinyjs(),
     tags$head(
       tags$meta(name="viewport", content="width=device-width, initial-scale=1.0"),
       tags$style(HTML("
@@ -1649,27 +1662,39 @@ server <- function(input, output, session) {
 
   observeEvent(input$init_btn, {
     req(input$student_name != "", input$herd_name != "")
-    prog2 <- Progress$new(session, min=0, max=1)
-    prog2$set(message="Initializing herd…", value=0.5)
-    on.exit(prog2$close(), add=TRUE)
 
-    st <- tryCatch(
+    # Capture inputs before leaving reactive context
+    n_cows <- as.integer(input$n_cows_target)
+    n_yrs  <- as.integer(input$n_years)
+    s_year <- as.integer(input$start_year)
+    seed   <- as.integer(input$seed)
+
+    disable("init_btn")
+    showNotification("Initializing herd — this takes a few seconds…",
+                     id = "init_notif", duration = NULL, type = "message")
+
+    future({
       initialize_sim(
-        n_cows_target = as.integer(input$n_cows_target),
-        n_years       = as.integer(input$n_years),
-        start_year    = as.integer(input$start_year),
-        seed          = as.integer(input$seed)
-      ),
-      error = function(e) {
-        showNotification(paste("Init error:", e$message), type="error", duration=8)
-        NULL
-      }
-    )
-    prog2$set(value=1.0)
-    if (is.null(st)) return()
-    sim$state <- st
-    showNotification("Herd initialized! Go to My Herd to see your animals.", type="message", duration=4)
-    updateTabItems(session, "tabs", "herd")
+        n_cows_target = n_cows,
+        n_years       = n_yrs,
+        start_year    = s_year,
+        seed          = seed
+      )
+    }, seed = TRUE) %...>% (function(st) {
+      removeNotification("init_notif")
+      enable("init_btn")
+      sim$state <- st
+      showNotification("Herd initialized! Go to My Herd to see your animals.",
+                       type = "message", duration = 4)
+      updateTabItems(session, "tabs", "herd")
+    }) %...!% (function(err) {
+      removeNotification("init_notif")
+      enable("init_btn")
+      showNotification(paste("Init error:", conditionMessage(err)),
+                       type = "error", duration = 8)
+    })
+
+    NULL  # return immediately; computation continues in background
   })
 
   # ── Save / Load ───────────────────────────────────────────────────────────────
@@ -2305,75 +2330,74 @@ server <- function(input, output, session) {
     # Only pass non-empty assignments
     mating_plan_final <- as.list(mating_plan_vec[nchar(mating_plan_vec) > 0])
 
-    prog <- Progress$new(session, min=0, max=1)
-    prog$set(message="Breeding generation…", value=0.1)
-    on.exit(prog$close(), add=TRUE)
+    # 3. Heifer IDs to admit from the pool (selected by student) — capture before async
+    heifer_sel <- input$heifer_sel_tbl_rows_selected
+    admit_ids  <- if (!is.null(hfd) && nrow(hfd) > 0 && length(heifer_sel) > 0)
+                    hfd$id[heifer_sel]
+                  else character(0)
+    if (!is.null(hfd) && nrow(hfd) > 0 && length(admit_ids) == 0)
+      showNotification("No heifers selected — herd may shrink this generation.",
+                       type = "warning", duration = 5)
 
-    interim <- tryCatch(
-      phase1_breed(
+    end_yr <- end_year_r()
+    budget  <- BUDGET_PER_COW * nrow(st$herd_df)
+
+    disable("advance_btn")
+    showNotification("Breeding generation — please wait…",
+                     id = "advance_notif", duration = NULL, type = "message")
+
+    future({
+      # Phase 1: breed + cull
+      interim <- phase1_breed(
         state        = st,
         use_bull_ids = bull_ids,
         cull_ids     = cull_ids,
         mating_plan  = if (length(mating_plan_final) > 0) mating_plan_final else NULL,
-        budget       = BUDGET_PER_COW * nrow(st$herd_df)
-      ),
-      error = function(e) {
-        showNotification(paste("Breeding error:", e$message), type="error", duration=8)
-        NULL
-      }
-    )
-    if (is.null(interim)) return()
-
-    n_bred  <- interim$n_bred %||% nrow(st$herd_df)
-    n_open2 <- interim$n_open %||% 0L
-
-    prog$set(message="Finalizing herd…", value=0.7)
-
-    # 3. Heifer IDs to admit from the pool (selected by student)
-    heifer_sel  <- input$heifer_sel_tbl_rows_selected
-    admit_ids   <- if (!is.null(hfd) && nrow(hfd) > 0 && length(heifer_sel) > 0)
-                     hfd$id[heifer_sel]
-                   else character(0)
-    if (!is.null(hfd) && nrow(hfd) > 0 && length(admit_ids) == 0)
-      showNotification("No heifers selected — herd may shrink this generation.",
-                       type="warning", duration=5)
-
-    new_state <- tryCatch(
-      phase2_finalize(
+        budget       = budget
+      )
+      # Phase 2: finalize herd, admit heifers
+      new_state <- phase2_finalize(
         state             = st,
         interim           = interim,
-        admit_heifer_ids  = interim$heifer_ids,  # always enqueue ALL new female calves
-        select_heifer_ids = admit_ids,            # student's selection from existing pool
+        admit_heifer_ids  = interim$heifer_ids,
+        select_heifer_ids = admit_ids,
         raise_bull_ids    = character(0),
-        end_year          = end_year_r()
-      ),
-      error = function(e) {
-        showNotification(paste("Finalize error:", e$message), type="error", duration=8)
-        NULL
+        end_year          = end_yr
+      )
+      list(new_state = new_state, n_open = interim$n_open %||% 0L)
+    }, seed = TRUE) %...>% (function(result) {
+      removeNotification("advance_notif")
+      enable("advance_btn")
+      new_state <- result$new_state
+      n_open2   <- result$n_open
+      sim$state <- new_state
+
+      if (n_open2 > 0)
+        showNotification(
+          sprintf("%d cow(s) were left open (budget limit or no semen available).", n_open2),
+          type = "warning", duration = 6
+        )
+
+      if (isTRUE(new_state$finished)) {
+        showNotification("Simulation complete! Check the Progress tab.",
+                         type = "message", duration = 6)
+        updateTabItems(session, "tabs", "progress")
+      } else {
+        gen_next <- new_state$year - new_state$start_year + 1
+        showNotification(
+          sprintf("Generation advanced! Now in Generation %d.", gen_next),
+          type = "message", duration = 4
+        )
+        updateTabItems(session, "tabs", "herd")
       }
-    )
-    if (is.null(new_state)) return()
+    }) %...!% (function(err) {
+      removeNotification("advance_notif")
+      enable("advance_btn")
+      showNotification(paste("Advance error:", conditionMessage(err)),
+                       type = "error", duration = 8)
+    })
 
-    prog$set(value=1.0)
-    sim$state <- new_state
-
-    if (n_open2 > 0)
-      showNotification(
-        sprintf("%d cow(s) were left open (budget limit or no semen available).", n_open2),
-        type="warning", duration=6
-      )
-
-    if (isTRUE(sim$state$finished)) {
-      showNotification("Simulation complete! Check the Progress tab.", type="message", duration=6)
-      updateTabItems(session, "tabs", "progress")
-    } else {
-      gen_next <- sim$state$year - sim$state$start_year + 1
-      showNotification(
-        sprintf("Generation advanced! Now in Generation %d.", gen_next),
-        type="message", duration=4
-      )
-      updateTabItems(session, "tabs", "herd")
-    }
+    NULL  # return immediately; computation continues in background
   })
 
   # ── Progress: genetic trend reactive ─────────────────────────────────────────
