@@ -733,7 +733,11 @@ phase1_breed <- function(state, cull_ids, use_bull_ids,
     next_cow_id   = next_cow_id,
     kinship_mat   = kinship_mat,   # updated with all calves born this round
     n_bred        = nrow(herd_breed),
-    n_open        = length(open_rows)   # cows left open due to budget constraint
+    n_open        = length(open_rows),  # cows left open due to budget constraint
+    open_cow_ids  = if (length(open_rows) > 0) herd_df$id[open_rows] else character(0),
+    bull_usage    = if (nrow(herd_breed) > 0)
+                      as.data.frame(table(bull_id = bull_assign), stringsAsFactors = FALSE)
+                    else data.frame(bull_id = character(0), Freq = integer(0))
   )
 }
 
@@ -1467,7 +1471,10 @@ ui <- dashboardPage(skin="blue",
                              tagList(icon("file-excel"), " Download Bulls (.xlsx)"),
                              class="btn-warning btn-sm")
             )
-          )
+          ),
+        fluidRow(
+          column(12, uiOutput("mating_report_ui"))
+        )
         )
       ),
 
@@ -1824,6 +1831,71 @@ server <- function(input, output, session) {
     phe_unit="g/day", pta_unit="g/day", pop_avg_pta=0,
     phe_scale=1, pta_scale=1,
     desc="Lower gPTA = less methane = better for environment"))
+
+  # ── Mating report ─────────────────────────────────────────────────────────────
+
+  output$mating_report_ui <- renderUI({
+    st <- sim$state
+    # Only show after at least one generation has been advanced
+    if (is.null(st) || is.null(st$mating_report)) return(NULL)
+    mr <- st$mating_report
+
+    # ── Bull usage table ──
+    bu <- mr$bull_usage
+    bull_rows <- if (!is.null(bu) && nrow(bu) > 0) {
+      apply(bu, 1, function(r) {
+        tags$tr(tags$td(r[["bull_id"]]), tags$td(r[["Freq"]]))
+      })
+    } else list(tags$tr(tags$td(colspan="2", "No mating data.")))
+
+    bull_tbl <- tags$table(
+      style = "width:100%;border-collapse:collapse;font-size:0.9em;",
+      tags$thead(
+        tags$tr(style = "background:#002855;color:#fff;",
+          tags$th(style="padding:6px 10px;text-align:left;", "Bull ID"),
+          tags$th(style="padding:6px 10px;text-align:left;", "# Cows Mated")
+        )
+      ),
+      tags$tbody(bull_rows)
+    )
+
+    # ── Open cows ──
+    open_ids <- mr$open_cow_ids
+    n_open   <- mr$n_open %||% 0L
+
+    open_section <- if (n_open == 0) {
+      p(style="color:#2e7d32;font-weight:600;", "✔ All cows were mated this generation.")
+    } else {
+      tagList(
+        p(style="color:#b91c1c;font-weight:600;",
+          sprintf("⚠ %d cow(s) left open (insufficient budget):", n_open)),
+        p(style="font-size:0.88em;color:#555;",
+          paste(open_ids, collapse=", ")),
+        p(style="font-size:0.85em;color:#666;font-style:italic;",
+          sprintf(
+            "Each open cow produces no calf this generation. Expect ~%d fewer heifers
+            available for replacement next round. If this persists, herd size will shrink.",
+            ceiling(n_open / 2)
+          )
+        )
+      )
+    }
+
+    box(
+      title = tagList(icon("venus-mars"), " Last Generation Mating Report"),
+      width = 12, status = "info", solidHeader = TRUE, collapsible = TRUE,
+      fluidRow(
+        column(5,
+          h5(strong("Bull Usage"), style="margin-top:0;"),
+          bull_tbl
+        ),
+        column(7,
+          h5(strong("Open Cows"), style="margin-top:0;"),
+          open_section
+        )
+      )
+    )
+  })
 
   # ── Herd roster table ─────────────────────────────────────────────────────────
 
@@ -2364,12 +2436,21 @@ server <- function(input, output, session) {
         raise_bull_ids    = character(0),
         end_year          = end_yr
       )
-      list(new_state = new_state, n_open = interim$n_open %||% 0L)
+      list(new_state  = new_state,
+           n_open     = interim$n_open     %||% 0L,
+           open_cow_ids = interim$open_cow_ids %||% character(0),
+           bull_usage = interim$bull_usage  %||% data.frame())
     }, seed = TRUE) %...>% (function(result) {
       removeNotification("advance_notif")
       enable("advance_btn")
       new_state <- result$new_state
       n_open2   <- result$n_open
+      # Attach mating report to state so My Herd tab can display it
+      new_state$mating_report <- list(
+        bull_usage   = result$bull_usage,
+        open_cow_ids = result$open_cow_ids,
+        n_open       = result$n_open
+      )
       sim$state <- new_state
 
       if (n_open2 > 0)
