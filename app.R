@@ -1707,7 +1707,11 @@ server <- function(input, output, session) {
   # ── Save / Load ───────────────────────────────────────────────────────────────
 
   output$save_btn <- downloadHandler(
-    filename = function() paste0("simoo_save_", Sys.Date(), ".rds"),
+    filename = function() {
+      st  <- isolate(sim$state)
+      gen <- if (!is.null(st)) st$year - st$start_year + 1 else 1
+      paste0("simoo_save_", Sys.Date(), "_G", gen, ".rds")
+    },
     content  = function(file) {
       saveRDS(list(
         state        = sim$state,
@@ -1939,6 +1943,38 @@ server <- function(input, output, session) {
       )
   }, server=FALSE)
 
+  output$heifer_roster_tbl <- renderDT({
+    st <- sim$state
+    req(st)
+    hp <- st$heifer_pool$df
+    if (is.null(hp) || nrow(hp) == 0) {
+      return(datatable(data.frame(Message="No heifers in pool yet."),
+                       rownames=FALSE, options=list(dom="t")))
+    }
+    df <- data.frame(
+      ID              = hp$id,
+      `Sire`          = hp$sire_id,
+      `Dam`           = hp$dam_id,
+      `Entry Year`    = hp$entry_year,
+      `Milk gPTA (lbs)` = round(hp$milk_pta, 1),
+      `Fat gPTA (lbs)`  = round(hp$fat_pta,  1),
+      `Prot gPTA (lbs)` = round(hp$prot_pta, 1),
+      `Meth gPTA (g/d)` = round(hp$meth_pta, 1),
+      `Rel %`           = round(hp$milk_rel * 100, 0),
+      Lethal            = ifelse(is.na(hp$lethal), "NN", hp$lethal),
+      Inbr              = round(hp$inbr, 4),
+      check.names = FALSE, stringsAsFactors = FALSE
+    )
+    datatable(df, rownames=FALSE, selection="none",
+              options=list(pageLength=15, dom="ftp"),
+              class="compact stripe") |>
+      formatStyle(
+        "Lethal",
+        color      = styleEqual(c("Nn","nn"), c("#e65100","#c62828")),
+        fontWeight = styleEqual(c("Nn","nn"), c("bold","bold"))
+      )
+  }, server=FALSE)
+
   # ── Herd download ─────────────────────────────────────────────────────────────
 
   output$download_herd_btn <- downloadHandler(
@@ -1957,7 +1993,29 @@ server <- function(input, output, session) {
                       "last_milk","last_fat","last_prot","last_meth","n_recs")
       col_order <- c(intersect(keep_order, names(herd)),
                      setdiff(names(herd), keep_order))
-      openxlsx::write.xlsx(herd[, col_order], file)
+      out <- herd[, col_order]
+      num_cols <- sapply(out, is.numeric)
+      out[num_cols] <- lapply(out[num_cols], round, digits=2)
+
+      # Heifers sheet
+      hp <- st$heifer_pool$df
+      if (!is.null(hp) && nrow(hp) > 0) {
+        heifer_order <- c("id","sire_id","dam_id","lethal","inbr",
+                          "milk_pta","fat_pta","prot_pta","meth_pta",
+                          "milk_rel","fat_rel","prot_rel","meth_rel","entry_year")
+        hp_out <- hp[, intersect(heifer_order, names(hp))]
+        hnum <- sapply(hp_out, is.numeric)
+        hp_out[hnum] <- lapply(hp_out[hnum], round, digits=2)
+      } else {
+        hp_out <- data.frame(Message="No heifers in pool yet.")
+      }
+
+      wb <- openxlsx::createWorkbook()
+      openxlsx::addWorksheet(wb, "Cows")
+      openxlsx::writeData(wb, "Cows", out)
+      openxlsx::addWorksheet(wb, "Heifers")
+      openxlsx::writeData(wb, "Heifers", hp_out)
+      openxlsx::saveWorkbook(wb, file, overwrite=TRUE)
     }
   )
 
@@ -1971,6 +2029,8 @@ server <- function(input, output, session) {
       bulls$dose_price <- compute_dose_price(bulls$n_daughters, bulls$source)
       drop_cols <- grep("_pa_rel$", names(bulls), value=TRUE)
       bulls <- bulls[, setdiff(names(bulls), drop_cols)]
+      num_cols <- sapply(bulls, is.numeric)
+      bulls[num_cols] <- lapply(bulls[num_cols], round, digits=2)
       openxlsx::write.xlsx(bulls, file)
     }
   )
