@@ -1026,6 +1026,30 @@ phase2_finalize <- function(state, interim, admit_heifer_ids,
   for (pa_col in c("milk_pa_rel","fat_pa_rel","prot_pa_rel","meth_pa_rel"))
     if (!pa_col %in% names(herd_df)) herd_df[[pa_col]] <- 0
 
+  # ── Update bull n_daughters BEFORE aging (heifers enter at n_recs=1) ──────────
+  for (brow in seq_len(nrow(bull_df))) {
+    bid      <- bull_df$id[brow]
+    new_daus <- sum(herd_df$sire_id == bid & herd_df$n_recs == 1L, na.rm=TRUE)
+    if (new_daus > 0L) {
+      bull_df$n_daughters[brow] <- bull_df$n_daughters[brow] + new_daus
+      tbv_row <- state$bull_true_bv[state$bull_true_bv$id == bid, , drop=FALSE]
+      if (nrow(tbv_row) > 0) {
+        tbv <- as.numeric(tbv_row[1, TRAIT_NAMES])
+        res_b <- estimate_bull_pta(bull_df$n_daughters[brow], tbv)
+        bull_df$milk_pta[brow]  <- res_b$pta["milk"]
+        bull_df$fat_pta[brow]   <- res_b$pta["fat"]
+        bull_df$prot_pta[brow]  <- res_b$pta["protein"]
+        bull_df$meth_pta[brow]  <- res_b$pta["methane"]
+        bull_df$milk_rel[brow]  <- res_b$reliability["milk"]
+        bull_df$fat_rel[brow]   <- res_b$reliability["fat"]
+        bull_df$prot_rel[brow]  <- res_b$reliability["protein"]
+        bull_df$meth_rel[brow]  <- res_b$reliability["methane"]
+        bull_df$merit[brow]     <- compute_merit(res_b$pta)
+      }
+    }
+  }
+  bull_df$dose_price <- compute_dose_price(bull_df$n_daughters, bull_df$source)
+
   # ── Age all milking cows + new lactation + update PTAs and last phenotypes ────
   herd_df$age    <- herd_df$age    + 1L
   herd_df$n_recs <- herd_df$n_recs + 1L
@@ -1059,34 +1083,6 @@ phase2_finalize <- function(state, interim, admit_heifer_ids,
     herd_df$last_prot[i] <- last_row["protein"]
     herd_df$last_meth[i] <- last_row["methane"]
   }
-
-  # ── Update bull n_daughters and re-estimate PTAs from herd daughters ────────
-  # Cows entering their first lactation this generation (n_recs == 1) are
-  # daughters that now provide new information for their sire's evaluation.
-  for (brow in seq_len(nrow(bull_df))) {
-    bid      <- bull_df$id[brow]
-    new_daus <- sum(herd_df$sire_id == bid & herd_df$n_recs == 1L, na.rm=TRUE)
-    if (new_daus > 0L) {
-      bull_df$n_daughters[brow] <- bull_df$n_daughters[brow] + new_daus
-      # Re-estimate PTA with updated daughter count using stored true BV
-      tbv_row <- state$bull_true_bv[state$bull_true_bv$id == bid, , drop=FALSE]
-      if (nrow(tbv_row) > 0) {
-        tbv <- as.numeric(tbv_row[1, TRAIT_NAMES])
-        res_b <- estimate_bull_pta(bull_df$n_daughters[brow], tbv)
-        bull_df$milk_pta[brow]  <- res_b$pta["milk"]
-        bull_df$fat_pta[brow]   <- res_b$pta["fat"]
-        bull_df$prot_pta[brow]  <- res_b$pta["protein"]
-        bull_df$meth_pta[brow]  <- res_b$pta["methane"]
-        bull_df$milk_rel[brow]  <- res_b$reliability["milk"]
-        bull_df$fat_rel[brow]   <- res_b$reliability["fat"]
-        bull_df$prot_rel[brow]  <- res_b$reliability["protein"]
-        bull_df$meth_rel[brow]  <- res_b$reliability["methane"]
-        bull_df$merit[brow]     <- compute_merit(res_b$pta)
-      }
-    }
-  }
-  # Recompute dose prices after daughter counts update
-  bull_df$dose_price <- compute_dose_price(bull_df$n_daughters, bull_df$source)
 
   # ── New AI bulls enter catalogue each generation ──────────────────────────
   # 5-10 new bulls per year across three reliability tiers:
