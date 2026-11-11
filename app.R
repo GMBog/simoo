@@ -115,12 +115,15 @@ HERD_SIZE_FLEX  <- 0.25  # ±25% of n_cows_target
 #   Mix proven + young → cheaper but lower accuracy
 BUDGET_PER_COW <- 15   # $ per cow per year
 
-compute_dose_price <- function(n_dau, source = "AI") {
-  # Price tiers based on daughter count (reflects real-world market):
+compute_dose_price <- function(n_dau, source = "AI", merit = 0) {
+  # Base price tier from daughter count (reliability proxy):
   #   Proven sires of sires (≥500 dau, >85% rel) → $25
   #   Young proven          (100-499 dau, ~65-85%) → $15
   #   Genomic / no daughters (<100 dau, ~28-65%)  → $8
-  price <- ifelse(n_dau >= 500, 25, ifelse(n_dau >= 100, 15, 8))
+  base  <- ifelse(n_dau >= 500, 25, ifelse(n_dau >= 100, 15, 8))
+  # Merit premium/discount: ±$1 per 10 NM$ above/below 0, capped at −$5 / +$20
+  prem  <- pmax(-5, pmin(round(merit / 10), 20))
+  price <- pmax(3, base + prem)   # floor at $3
   ifelse(source == "Herd", 2, price)
 }
 
@@ -319,8 +322,29 @@ initialize_sim <- function(seed=42, start_year=1, n_cows_target=100, n_years=5) 
   SP$setVarE(h2=h2)
 
   founders  <- newPop(founderPop, simParam=SP)
-  all_fem   <- founders[founders@sex=="F"]
-  all_mal   <- founders[founders@sex=="M"]
+
+  # ── Burn-in: 3 generations of random mating in a small pool ─────────────────
+  # Creates baseline inbreeding (F ≈ 0.02–0.05) so the starting herd is not at F=0
+  n_heifers_init_tmp <- max(5L, round(n_cows_target * 0.25))
+  n_need_total <- n_cows_target + n_heifers_init_tmp + N_AI_BULLS
+  burn_n  <- min(max(80L, n_need_total * 2L), 300L)
+  b_half  <- burn_n %/% 2L
+  b_fem0  <- founders[founders@sex == "F"]
+  b_mal0  <- founders[founders@sex == "M"]
+  burn_pop <- c(b_fem0[seq_len(min(b_half, b_fem0@nInd))],
+                b_mal0[seq_len(min(b_half, b_mal0@nInd))])
+  n_cross <- min(b_half, b_fem0@nInd, b_mal0@nInd)
+  for (.i in seq_len(3))
+    burn_pop <- randCross(burn_pop, nCrosses=n_cross, nProgeny=2, simParam=SP)
+
+  all_fem <- burn_pop[burn_pop@sex == "F"]
+  all_mal <- burn_pop[burn_pop@sex == "M"]
+  # Supplement from original founders if burn-in pop is too small for the herd size
+  n_fem_need <- n_cows_target + n_heifers_init_tmp
+  if (all_fem@nInd < n_fem_need)
+    all_fem <- c(all_fem, b_fem0[seq_len(min(n_fem_need - all_fem@nInd, b_fem0@nInd))])
+  if (all_mal@nInd < N_AI_BULLS)
+    all_mal <- c(all_mal, b_mal0[seq_len(min(N_AI_BULLS - all_mal@nInd, b_mal0@nInd))])
   n_heifers_init <- max(5L, round(n_cows_target * 0.25))
   n_need    <- n_cows_target + n_heifers_init
   herd_all  <- all_fem[sample(all_fem@nInd, min(n_need, all_fem@nInd))]
@@ -404,7 +428,7 @@ initialize_sim <- function(seed=42, start_year=1, n_cows_target=100, n_years=5) 
     prot_rel=bull_rel[,"protein"], meth_rel=bull_rel[,"methane"],
     n_daughters=founder_ndau,
     birth_year=bull_birth_years(founder_ndau, start_year),
-    dose_price=compute_dose_price(founder_ndau, "AI"),
+    dose_price=compute_dose_price(founder_ndau, "AI", apply(bull_pta,1,compute_merit)),
     stringsAsFactors=FALSE)
 
   cow_true_bv  <- as.data.frame(cow_bv);  cow_true_bv$id  <- cow_ids
@@ -530,7 +554,8 @@ phase1_breed <- function(state, cull_ids, use_bull_ids,
   # ── Budget enforcement: limit how many cows can be bred ─────────────────────
   if (!"dose_price" %in% names(sel_bulls))
     sel_bulls$dose_price <- compute_dose_price(sel_bulls$n_daughters,
-                              if ("source" %in% names(sel_bulls)) sel_bulls$source else "AI")
+                              if ("source" %in% names(sel_bulls)) sel_bulls$source else "AI",
+                              if ("merit"  %in% names(sel_bulls)) sel_bulls$merit  else 0)
   avg_dose_price <- mean(sel_bulls$dose_price, na.rm=TRUE)
   n_total        <- nrow(herd_df)
 
@@ -1021,7 +1046,8 @@ phase2_finalize <- function(state, interim, admit_heifer_ids,
   if (!"birth_year" %in% names(bull_df)) bull_df$birth_year <- NA_integer_
   if (!"dose_price" %in% names(bull_df))
     bull_df$dose_price <- compute_dose_price(bull_df$n_daughters,
-                                             if("source" %in% names(bull_df)) bull_df$source else "AI")
+                                             if("source" %in% names(bull_df)) bull_df$source else "AI",
+                                             if("merit"  %in% names(bull_df)) bull_df$merit  else 0)
   # PA reliability columns (added in v4 — founders and old saves default to 0)
   for (pa_col in c("milk_pa_rel","fat_pa_rel","prot_pa_rel","meth_pa_rel"))
     if (!pa_col %in% names(herd_df)) herd_df[[pa_col]] <- 0
@@ -1048,7 +1074,7 @@ phase2_finalize <- function(state, interim, admit_heifer_ids,
       }
     }
   }
-  bull_df$dose_price <- compute_dose_price(bull_df$n_daughters, bull_df$source)
+  bull_df$dose_price <- compute_dose_price(bull_df$n_daughters, bull_df$source, bull_df$merit)
 
   # ── Age all milking cows + new lactation + update PTAs and last phenotypes ────
   herd_df$age    <- herd_df$age    + 1L
@@ -1119,7 +1145,7 @@ phase2_finalize <- function(state, interim, admit_heifer_ids,
       prot_rel=res$reliability["protein"], meth_rel=res$reliability["methane"],
       n_daughters=new_bull_ndau[nb],
       birth_year=bull_birth_years(new_bull_ndau[nb], new_yr),
-      dose_price=compute_dose_price(new_bull_ndau[nb], "AI"),
+      dose_price=compute_dose_price(new_bull_ndau[nb], "AI", compute_merit(res$pta)),
       stringsAsFactors=FALSE))
     # Store true BV so future daughter updates can re-estimate the PTA
     new_bv_row <- as.data.frame(t(nb_bv))
@@ -2022,7 +2048,7 @@ server <- function(input, output, session) {
       req(st)
       bulls <- st$bull_df
       # Recompute dose price from current daughter counts (stored value may be stale)
-      bulls$dose_price <- compute_dose_price(bulls$n_daughters, bulls$source)
+      bulls$dose_price <- compute_dose_price(bulls$n_daughters, bulls$source, bulls$merit)
       drop_cols <- grep("_pa_rel$", names(bulls), value=TRUE)
       bulls <- bulls[, setdiff(names(bulls), drop_cols)]
       num_cols <- sapply(bulls, is.numeric)
@@ -2040,7 +2066,7 @@ server <- function(input, output, session) {
 
     # Bull catalogue for this generation
     bd <- st$bull_df
-    bd$dose_price <- compute_dose_price(bd$n_daughters, bd$source)
+    bd$dose_price <- compute_dose_price(bd$n_daughters, bd$source, bd$merit)
     dec$bull_df <- bd
 
     # Cow table for culling decisions
